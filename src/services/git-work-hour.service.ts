@@ -14,18 +14,26 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 
 /**
+ * Extended filter options supporting an optional target branch.
+ */
+export type BranchWorkLogFilters = WorkLogFilters & {
+    branch?: string;
+};
+
+/**
  * Service that reads git commit logs, estimates work hour ranges, and exports Markdown reports.
  */
 export class GitWorkHourEstimatorService implements WorkHourEstimator {
     private readonly fieldSeparator = '\x1f';
     private readonly recordSeparator = '\x1e';
     private readonly defaultConfig: HourEstimationConfig;
-    private readonly defaultFilters: WorkLogFilters;
+    private readonly defaultFilters: BranchWorkLogFilters;
     private readonly estimatesRootDir = 'estimate';
     private readonly reportFileName = 'estimation.md';
+    private readonly preferredMainBranches = ['main', 'master', 'develop'];
 
     constructor(
-        defaultFilters: WorkLogFilters = DEFAULT_WORK_LOG_FILTERS,
+        defaultFilters: BranchWorkLogFilters = DEFAULT_WORK_LOG_FILTERS,
         defaultConfig: HourEstimationConfig = DEFAULT_HOUR_ESTIMATION_CONFIG
     ) {
         this.defaultFilters = { ...defaultFilters };
@@ -33,19 +41,81 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
     }
 
     /**
-     * Reads commits and changed files from the repository using default filters when omitted.
+     * Discovers the repository's default/main branch offline using `git branch -r`.
+     */
+    public async detectDefaultBranch(repoDir: string): Promise<string> {
+        // Step 1: Query remote-tracking branches locally without touching the network.
+        const { stdout } = await execFileAsync('git', ['branch', '-r'], {
+            cwd: repoDir,
+            maxBuffer: 5 * 1024 * 1024,
+        });
+
+        const lines = stdout
+            .split('\n')
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0);
+
+        if (lines.length === 0) {
+            return 'HEAD';
+        }
+
+        // Step 2: Check for an explicit symbolic pointer like "origin/HEAD -> origin/main".
+        const headPointerLine = lines.find((line) => line.includes('->'));
+        if (headPointerLine) {
+            const targetRef = headPointerLine.split('->').pop()?.trim() ?? '';
+            const normalizedTarget = targetRef.replace(/^origin\//, '').trim();
+            if (normalizedTarget.length > 0) {
+                return normalizedTarget;
+            }
+        }
+
+        // Step 3: Normalize remote branch names (e.g. "origin/main" -> "main").
+        const normalizedBranches = lines
+            .filter((line) => !line.includes('->'))
+            .map((line) => line.replace(/^origin\//, '').trim())
+            .filter((branch) => branch.length > 0);
+
+        // Step 4: Prefer standard main branch names if present.
+        for (const candidate of this.preferredMainBranches) {
+            if (normalizedBranches.includes(candidate)) {
+                return candidate;
+            }
+        }
+
+        // Step 5: Fallback to the first available remote branch or HEAD.
+        return normalizedBranches[0] ?? 'HEAD';
+    }
+
+    /**
+     * Resolves which branch should be inspected: user-specified branch or offline default branch.
+     */
+    public async resolveTargetBranch(repoDir: string, requestedBranch?: string): Promise<string> {
+        const trimmed = requestedBranch?.trim();
+        if (trimmed) {
+            return trimmed;
+        }
+
+        return this.detectDefaultBranch(repoDir);
+    }
+
+    /**
+     * Reads commits and changed files from the repository for the selected or default branch.
      */
     public async getWorkItems(
         repoDir: string,
-        filters?: WorkLogFilters
+        filters?: BranchWorkLogFilters
     ): Promise<CommitWorkItem[]> {
         // Step 1: Resolve active filters (defaults to 90 days ago and all authors).
         const resolvedFilters = this.resolveFilters(filters);
 
-        // Step 2: Build git log command arguments with safe field and record delimiters.
+        // Step 2: Resolve target branch offline when not explicitly provided.
+        const targetBranch = await this.resolveTargetBranch(repoDir, resolvedFilters.branch);
+
+        // Step 3: Build git log command arguments with safe field and record delimiters.
         const header = ['%H', '%an', '%aI', '%s'].join(this.fieldSeparator);
         const args = [
             'log',
+            targetBranch,
             `--pretty=format:${this.recordSeparator}${header}${this.fieldSeparator}`,
             '--name-only',
         ];
@@ -60,13 +130,13 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
             args.push(`--author=${resolvedFilters.author}`);
         }
 
-        // Step 3: Run git log inside the target repository directory.
+        // Step 4: Run git log inside the target repository directory.
         const { stdout } = await execFileAsync('git', args, {
             cwd: repoDir,
             maxBuffer: 15 * 1024 * 1024,
         });
 
-        // Step 4: Parse stdout chunks into structured CommitWorkItem objects.
+        // Step 5: Parse stdout chunks into structured CommitWorkItem objects.
         return stdout
             .split(this.recordSeparator)
             .map((chunk) => chunk.trim())
@@ -97,7 +167,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
     public calculateHourMetrics(
         items: CommitWorkItem[],
         config: HourEstimationConfig = this.defaultConfig,
-        appliedFilters: WorkLogFilters = this.defaultFilters
+        appliedFilters: BranchWorkLogFilters = this.defaultFilters
     ): WorkHourMetrics {
         if (items.length === 0) {
             return {
@@ -114,7 +184,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
             };
         }
 
-        // Step 5: Group commits by calendar day (YYYY-MM-DD) so multiple commits in one day
+        // Step 6: Group commits by calendar day (YYYY-MM-DD) so multiple commits in one day
         // count as a single active work day.
         const activeDaySet = new Set<string>();
         const uniqueFilesSet = new Set<string>();
@@ -142,7 +212,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
         const uniqueFilesTouched = uniqueFilesSet.size;
         const commitsPerActiveDay = Number((totalCommits / Math.max(1, activeDays)).toFixed(2));
 
-        // Step 6: Compute base hours from active days and unique files, then derive
+        // Step 7: Compute base hours from active days and unique files, then derive
         // optimistic and conservative hour ranges.
         const rawBaseHours =
             activeDays * config.hoursPerActiveDay + uniqueFilesTouched * config.hoursPerUniqueFile;
@@ -165,16 +235,22 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
     }
 
     /**
-     * Fetches work items and calculates hour metrics in one step.
+     * Fetches work items and calculates hour metrics in one step for the chosen or default branch.
      */
     public async estimateFromRepository(
         repoDir: string,
-        filters?: WorkLogFilters,
+        filters?: BranchWorkLogFilters,
         config: HourEstimationConfig = this.defaultConfig
     ): Promise<WorkHourMetrics> {
         const resolvedFilters = this.resolveFilters(filters);
-        const items = await this.getWorkItems(repoDir, resolvedFilters);
-        return this.calculateHourMetrics(items, config, resolvedFilters);
+        const resolvedBranch = await this.resolveTargetBranch(repoDir, resolvedFilters.branch);
+        const finalFilters: BranchWorkLogFilters = {
+            ...resolvedFilters,
+            branch: resolvedBranch,
+        };
+
+        const items = await this.getWorkItems(repoDir, finalFilters);
+        return this.calculateHourMetrics(items, config, finalFilters);
     }
 
     /**
@@ -185,14 +261,14 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
         metrics: WorkHourMetrics,
         outputRootDir: string = this.estimatesRootDir
     ): Promise<string> {
-        // Step 7: Resolve repository folder name and ensure target directory exists.
+        // Step 8: Resolve repository folder name and ensure target directory exists.
         const repoName = this.extractRepoName(repoDir);
         const targetDir = resolve(process.cwd(), outputRootDir, repoName);
         const targetFile = join(targetDir, this.reportFileName);
 
         await mkdir(targetDir, { recursive: true });
 
-        // Step 8: Build Markdown content and write it to disk.
+        // Step 9: Build Markdown content and write it to disk.
         const markdownContent = this.formatMarkdownReport(repoName, metrics);
         await writeFile(targetFile, markdownContent, 'utf-8');
 
@@ -204,7 +280,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
      */
     public async estimateAndSaveMarkdown(
         repoDir: string,
-        filters?: WorkLogFilters,
+        filters?: BranchWorkLogFilters,
         config: HourEstimationConfig = this.defaultConfig,
         outputRootDir: string = this.estimatesRootDir
     ): Promise<{ metrics: WorkHourMetrics; filePath: string }> {
@@ -227,6 +303,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
      * Formats WorkHourMetrics into a clear Markdown summary for review or LLM input.
      */
     private formatMarkdownReport(repoName: string, metrics: WorkHourMetrics): string {
+        const branchName = (metrics.appliedFilters as BranchWorkLogFilters).branch ?? 'padrão';
         const prefixesLines =
             Object.keys(metrics.subjectPrefixes).length > 0
                 ? Object.entries(metrics.subjectPrefixes)
@@ -250,6 +327,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
             `- **Total de alterações em arquivos:** ${metrics.totalFileTouches}`,
             '',
             '## Filtros Aplicados',
+            `- **Branch:** ${branchName}`,
             `- **Since:** ${metrics.appliedFilters.since ?? 'não informado'}`,
             `- **Until:** ${metrics.appliedFilters.until ?? 'não informado'}`,
             `- **Author:** ${metrics.appliedFilters.author ?? 'todos'}`,
@@ -263,11 +341,12 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
     /**
      * Applies default filters (90 days ago, all authors) when specific fields are not provided.
      */
-    private resolveFilters(filters?: WorkLogFilters): WorkLogFilters {
+    private resolveFilters(filters?: BranchWorkLogFilters): BranchWorkLogFilters {
         return {
             since: filters?.since?.trim() || this.defaultFilters.since,
             until: filters?.until?.trim() || this.defaultFilters.until,
             author: filters?.author?.trim() || this.defaultFilters.author,
+            branch: filters?.branch?.trim() || (this.defaultFilters as BranchWorkLogFilters).branch,
         };
     }
 }

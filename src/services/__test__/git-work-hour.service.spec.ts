@@ -81,6 +81,24 @@ function buildMockGitLogStdout(
         .join('\n');
 }
 
+/**
+ * Configures mockExecFile to handle both `git branch -r` and `git log` commands.
+ */
+function setupGitCommandMocks(remoteBranchesOutput: string, logOutput: string): void {
+    mockExecFile.mockImplementation((_cmd, args, _opts, callback) => {
+        if (typeof callback !== 'function') {
+            return;
+        }
+
+        if (args[0] === 'branch' && args[1] === '-r') {
+            callback(null, remoteBranchesOutput, '');
+            return;
+        }
+
+        callback(null, logOutput, '');
+    });
+}
+
 describe('GitWorkHourEstimatorService', () => {
     beforeEach(() => {
         jest.clearAllMocks();
@@ -89,9 +107,28 @@ describe('GitWorkHourEstimatorService', () => {
     });
 
     /**
-     * Verifies that getWorkItems applies the default 90-day filter and parses commits and files.
+     * Verifies that detectDefaultBranch detects the main branch offline using `git branch -r`.
      */
-    it('deve aplicar o filtro padrão de 90 dias e parsear commits com arquivos alterados', async () => {
+    it('deve descobrir a branch principal offline via git branch -r quando não informada', async () => {
+        setupGitCommandMocks('  origin/HEAD -> origin/main\n  origin/main\n  origin/develop\n', '');
+
+        const service = new GitWorkHourEstimatorService();
+        const detectedBranch = await service.detectDefaultBranch('/repo/exemplo');
+
+        expect(detectedBranch).toBe('main');
+        expect(mockExecFile).toHaveBeenCalledWith(
+            'git',
+            ['branch', '-r'],
+            expect.objectContaining({ cwd: '/repo/exemplo' }),
+            expect.any(Function)
+        );
+    });
+
+    /**
+     * Verifies that getWorkItems applies the default 90-day filter, detects main branch, and parses commits.
+     */
+    it('deve aplicar o filtro padrão de 90 dias, usar branch principal e parsear commits', async () => {
+        // Step 1: Prepare simulated git branch -r and git log outputs.
         const stdout = buildMockGitLogStdout([
             {
                 hash: 'hash-1',
@@ -109,23 +146,22 @@ describe('GitWorkHourEstimatorService', () => {
             },
         ]);
 
-        mockExecFile.mockImplementation((_cmd, _args, _opts, callback) => {
-            if (typeof callback === 'function') {
-                callback(null, stdout, '');
-            }
-        });
+        // Step 2: Configure mocks for offline branch discovery and commit history reading.
+        setupGitCommandMocks('  origin/HEAD -> origin/main\n  origin/main\n', stdout);
 
+        // Step 3: Fetch work items without specifying a branch.
         const service = new GitWorkHourEstimatorService();
         const items = await service.getWorkItems('/repo/exemplo');
 
-        expect(mockExecFile).toHaveBeenCalledTimes(1);
+        expect(mockExecFile).toHaveBeenCalledTimes(2);
         expect(mockExecFile).toHaveBeenCalledWith(
             'git',
-            expect.arrayContaining(['log', '--name-only', '--since=90 days ago']),
+            expect.arrayContaining(['log', 'main', '--name-only', '--since=90 days ago']),
             expect.objectContaining({ cwd: '/repo/exemplo' }),
             expect.any(Function)
         );
 
+        // Step 4: Validate parsed commit items.
         const expectedItems: CommitWorkItem[] = [
             {
                 hash: 'hash-1',
@@ -147,25 +183,25 @@ describe('GitWorkHourEstimatorService', () => {
     });
 
     /**
-     * Verifies that custom filters (since, until, author) are passed to git log.
+     * Verifies that custom filters (since, until, author, branch) are passed to git log.
      */
-    it('deve repassar filtros personalizados de since, until e author para o git log', async () => {
-        mockExecFile.mockImplementation((_cmd, _args, _opts, callback) => {
-            if (typeof callback === 'function') {
-                callback(null, '', '');
-            }
-        });
+    it('deve repassar filtros personalizados de since, until, author e branch para o git log', async () => {
+        setupGitCommandMocks('', '');
 
         const service = new GitWorkHourEstimatorService();
         await service.getWorkItems('/repo/exemplo', {
             since: '2026-01-01',
             until: '2026-03-31',
             author: 'Douglas',
+            branch: 'feature/estimativas',
         });
 
+        expect(mockExecFile).toHaveBeenCalledTimes(1);
         expect(mockExecFile).toHaveBeenCalledWith(
             'git',
             expect.arrayContaining([
+                'log',
+                'feature/estimativas',
                 '--since=2026-01-01',
                 '--until=2026-03-31',
                 '--author=Douglas',
@@ -251,11 +287,7 @@ describe('GitWorkHourEstimatorService', () => {
             },
         ]);
 
-        mockExecFile.mockImplementation((_cmd, _args, _opts, callback) => {
-            if (typeof callback === 'function') {
-                callback(null, stdout, '');
-            }
-        });
+        setupGitCommandMocks('  origin/main\n', stdout);
 
         const service = new GitWorkHourEstimatorService();
         const result = await service.estimateFromRepository('/repo/api', {
@@ -266,6 +298,7 @@ describe('GitWorkHourEstimatorService', () => {
             since: '30 days ago',
             until: undefined,
             author: undefined,
+            branch: 'main',
         });
         expect(result.activeDays).toBe(1);
         expect(result.baseHours).toBe(6.3);
@@ -332,11 +365,7 @@ describe('GitWorkHourEstimatorService', () => {
             },
         ]);
 
-        mockExecFile.mockImplementation((_cmd, _args, _opts, callback) => {
-            if (typeof callback === 'function') {
-                callback(null, stdout, '');
-            }
-        });
+        setupGitCommandMocks('  origin/master\n', stdout);
 
         const service = new GitWorkHourEstimatorService();
         const result = await service.estimateAndSaveMarkdown('/repos/dsweb-cli');
