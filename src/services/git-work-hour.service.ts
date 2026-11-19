@@ -41,10 +41,23 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
     }
 
     /**
+     * Normalizes a branch name for display in metrics and Markdown reports (e.g. `origin/prod-v1.0` -> `prod-v1.0`).
+     */
+    private normalizeBranchDisplayName(branch: string): string {
+        // Step 1: Strip remote prefixes while keeping `HEAD` intact if no branch exists.
+        const trimmed = branch.trim();
+        if (!trimmed || trimmed === 'HEAD') {
+            return trimmed || 'HEAD';
+        }
+
+        return trimmed.replace(/^remotes\//, '').replace(/^origin\//, '').trim() || trimmed;
+    }
+
+    /**
      * Discovers the repository's default/main branch offline using `git branch -r`.
      */
     public async detectDefaultBranch(repoDir: string): Promise<string> {
-        // Step 1: Query remote-tracking branches locally without touching the network.
+        // Step 2: Query remote-tracking branches locally without touching the network.
         const { stdout } = await execFileAsync('git', ['branch', '-r'], {
             cwd: repoDir,
             maxBuffer: 5 * 1024 * 1024,
@@ -59,43 +72,80 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
             return 'HEAD';
         }
 
-        // Step 2: Check for an explicit symbolic pointer like "origin/HEAD -> origin/main".
+        // Step 3: Check for an explicit symbolic pointer like "origin/HEAD -> origin/main".
         const headPointerLine = lines.find((line) => line.includes('->'));
         if (headPointerLine) {
             const targetRef = headPointerLine.split('->').pop()?.trim() ?? '';
-            const normalizedTarget = targetRef.replace(/^origin\//, '').trim();
+            const normalizedTarget = this.normalizeBranchDisplayName(targetRef);
             if (normalizedTarget.length > 0) {
                 return normalizedTarget;
             }
         }
 
-        // Step 3: Normalize remote branch names (e.g. "origin/main" -> "main").
+        // Step 4: Normalize remote branch names (e.g. "origin/main" -> "main").
         const normalizedBranches = lines
             .filter((line) => !line.includes('->'))
-            .map((line) => line.replace(/^origin\//, '').trim())
+            .map((line) => this.normalizeBranchDisplayName(line))
             .filter((branch) => branch.length > 0);
 
-        // Step 4: Prefer standard main branch names if present.
+        // Step 5: Prefer standard main branch names if present.
         for (const candidate of this.preferredMainBranches) {
             if (normalizedBranches.includes(candidate)) {
                 return candidate;
             }
         }
 
-        // Step 5: Fallback to the first available remote branch or HEAD.
+        // Step 6: Fallback to the first available remote branch or HEAD.
         return normalizedBranches[0] ?? 'HEAD';
     }
 
     /**
-     * Resolves which branch should be inspected: user-specified branch or offline default branch.
+     * Resolves which clean branch name should be inspected and reported:
+     * user-specified branch or offline default branch.
      */
     public async resolveTargetBranch(repoDir: string, requestedBranch?: string): Promise<string> {
         const trimmed = requestedBranch?.trim();
         if (trimmed) {
-            return trimmed;
+            return this.normalizeBranchDisplayName(trimmed);
         }
 
         return this.detectDefaultBranch(repoDir);
+    }
+
+    /**
+     * Checks offline whether a git revision/branch reference exists locally in the repository.
+     */
+    private async isValidGitRef(repoDir: string, ref: string): Promise<boolean> {
+        // Step 7: Verify local git reference existence offline using `git rev-parse --verify`.
+        try {
+            await execFileAsync('git', ['rev-parse', '--verify', '--quiet', ref], {
+                cwd: repoDir,
+                maxBuffer: 1024 * 1024,
+            });
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Resolves a clean branch name to an internal git ref (e.g. `origin/prod-v1.0` or `prod-v1.0`)
+     * used only when running `git log`.
+     */
+    private async resolveGitLogRef(repoDir: string, cleanBranch: string): Promise<string> {
+        // Step 8: Build candidate references so remote-only branches like `origin/prod-v1.0` work in `git log`.
+        const withoutOrigin = this.normalizeBranchDisplayName(cleanBranch);
+        const candidates = Array.from(
+            new Set([`origin/${withoutOrigin}`, withoutOrigin, cleanBranch, 'HEAD'].filter(Boolean))
+        );
+
+        for (const candidate of candidates) {
+            if (await this.isValidGitRef(repoDir, candidate)) {
+                return candidate;
+            }
+        }
+
+        return withoutOrigin || 'HEAD';
     }
 
     /**
@@ -105,17 +155,18 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
         repoDir: string,
         filters?: BranchWorkLogFilters
     ): Promise<CommitWorkItem[]> {
-        // Step 1: Resolve active filters (defaults to 90 days ago and all authors).
+        // Step 9: Resolve active filters (defaults to 90 days ago and all authors).
         const resolvedFilters = this.resolveFilters(filters);
 
-        // Step 2: Resolve target branch offline when not explicitly provided.
+        // Step 10: Resolve clean branch name and map to an internal git ref solely for `git log`.
         const targetBranch = await this.resolveTargetBranch(repoDir, resolvedFilters.branch);
+        const gitLogRef = await this.resolveGitLogRef(repoDir, targetBranch);
 
-        // Step 3: Build git log command arguments with safe field and record delimiters.
+        // Step 11: Build git log command arguments with safe field and record delimiters.
         const header = ['%H', '%an', '%aI', '%s'].join(this.fieldSeparator);
         const args = [
             'log',
-            targetBranch,
+            gitLogRef,
             `--pretty=format:${this.recordSeparator}${header}${this.fieldSeparator}`,
             '--name-only',
         ];
@@ -130,13 +181,13 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
             args.push(`--author=${resolvedFilters.author}`);
         }
 
-        // Step 4: Run git log inside the target repository directory.
+        // Step 12: Run git log inside the target repository directory.
         const { stdout } = await execFileAsync('git', args, {
             cwd: repoDir,
             maxBuffer: 15 * 1024 * 1024,
         });
 
-        // Step 5: Parse stdout chunks into structured CommitWorkItem objects.
+        // Step 13: Parse stdout chunks into structured CommitWorkItem objects.
         return stdout
             .split(this.recordSeparator)
             .map((chunk) => chunk.trim())
@@ -184,7 +235,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
             };
         }
 
-        // Step 6: Group commits by calendar day (YYYY-MM-DD) so multiple commits in one day
+        // Step 14: Group commits by calendar day (YYYY-MM-DD) so multiple commits in one day
         // count as a single active work day.
         const activeDaySet = new Set<string>();
         const uniqueFilesSet = new Set<string>();
@@ -212,7 +263,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
         const uniqueFilesTouched = uniqueFilesSet.size;
         const commitsPerActiveDay = Number((totalCommits / Math.max(1, activeDays)).toFixed(2));
 
-        // Step 7: Compute base hours from active days and unique files, then derive
+        // Step 15: Compute base hours from active days and unique files, then derive
         // optimistic and conservative hour ranges.
         const rawBaseHours =
             activeDays * config.hoursPerActiveDay + uniqueFilesTouched * config.hoursPerUniqueFile;
@@ -235,7 +286,8 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
     }
 
     /**
-     * Fetches work items and calculates hour metrics in one step for the chosen or default branch.
+     * Fetches work items and calculates hour metrics in one step for the chosen or default branch,
+     * keeping the clean branch name in appliedFilters.
      */
     public async estimateFromRepository(
         repoDir: string,
@@ -243,10 +295,10 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
         config: HourEstimationConfig = this.defaultConfig
     ): Promise<WorkHourMetrics> {
         const resolvedFilters = this.resolveFilters(filters);
-        const resolvedBranch = await this.resolveTargetBranch(repoDir, resolvedFilters.branch);
+        const cleanBranch = await this.resolveTargetBranch(repoDir, resolvedFilters.branch);
         const finalFilters: BranchWorkLogFilters = {
             ...resolvedFilters,
-            branch: resolvedBranch,
+            branch: cleanBranch,
         };
 
         const items = await this.getWorkItems(repoDir, finalFilters);
@@ -257,7 +309,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
      * Checks if an estimate file already exists for the repository and logs a warning before overwriting.
      */
     private async warnIfEstimateExists(targetFile: string, repoName: string): Promise<void> {
-        // Step 8: Check file existence and emit a console warning if it will be overwritten.
+        // Step 16: Check file existence and emit a console warning if it will be overwritten.
         try {
             await access(targetFile);
             console.warn(
@@ -277,7 +329,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
         commits: CommitWorkItem[] = [],
         outputRootDir: string = this.estimatesRootDir
     ): Promise<string> {
-        // Step 9: Resolve repository folder name and ensure target directory exists.
+        // Step 17: Resolve repository folder name and ensure target directory exists.
         const repoName = this.extractRepoName(repoDir);
         const targetDir = resolve(process.cwd(), outputRootDir, repoName);
         const targetFile = join(targetDir, this.reportFileName);
@@ -285,7 +337,7 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
         await mkdir(targetDir, { recursive: true });
         await this.warnIfEstimateExists(targetFile, repoName);
 
-        // Step 10: Build Markdown content including the commit history table and write it to disk.
+        // Step 18: Build Markdown content including the commit history table and write it to disk.
         const markdownContent = this.formatMarkdownReport(repoName, metrics, commits);
         await writeFile(targetFile, markdownContent, 'utf-8');
 
@@ -301,12 +353,12 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
         config: HourEstimationConfig = this.defaultConfig,
         outputRootDir: string = this.estimatesRootDir
     ): Promise<{ metrics: WorkHourMetrics; filePath: string; commits: CommitWorkItem[] }> {
-        // Step 11: Resolve filters/branch, collect commit work items, compute metrics, and save report.
+        // Step 19: Resolve filters/clean branch, collect commit work items, compute metrics, and save report.
         const resolvedFilters = this.resolveFilters(filters);
-        const resolvedBranch = await this.resolveTargetBranch(repoDir, resolvedFilters.branch);
+        const cleanBranch = await this.resolveTargetBranch(repoDir, resolvedFilters.branch);
         const finalFilters: BranchWorkLogFilters = {
             ...resolvedFilters,
-            branch: resolvedBranch,
+            branch: cleanBranch,
         };
 
         const commits = await this.getWorkItems(repoDir, finalFilters);
@@ -353,14 +405,17 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
     }
 
     /**
-     * Formats WorkHourMetrics and commit history into a clear Markdown summary.
+     * Formats WorkHourMetrics and commit history into a clear Markdown summary using the clean branch name.
      */
     private formatMarkdownReport(
         repoName: string,
         metrics: WorkHourMetrics,
         commits: CommitWorkItem[] = []
     ): string {
-        const branchName = (metrics.appliedFilters as BranchWorkLogFilters).branch ?? 'padrão';
+        const rawBranch = (metrics.appliedFilters as BranchWorkLogFilters).branch ?? 'padrão';
+        const branchName =
+            rawBranch === 'padrão' ? 'padrão' : this.normalizeBranchDisplayName(rawBranch);
+
         const prefixesLines =
             Object.keys(metrics.subjectPrefixes).length > 0
                 ? Object.entries(metrics.subjectPrefixes)
@@ -404,11 +459,14 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
      * Applies default filters (90 days ago, all authors) when specific fields are not provided.
      */
     private resolveFilters(filters?: BranchWorkLogFilters): BranchWorkLogFilters {
+        const rawBranch =
+            filters?.branch?.trim() || (this.defaultFilters as BranchWorkLogFilters).branch;
+
         return {
             since: filters?.since?.trim() || this.defaultFilters.since,
             until: filters?.until?.trim() || this.defaultFilters.until,
             author: filters?.author?.trim() || this.defaultFilters.author,
-            branch: filters?.branch?.trim() || (this.defaultFilters as BranchWorkLogFilters).branch,
+            branch: rawBranch ? this.normalizeBranchDisplayName(rawBranch) : undefined,
         };
     }
 }

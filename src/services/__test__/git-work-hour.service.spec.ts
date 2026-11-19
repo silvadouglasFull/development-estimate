@@ -84,9 +84,14 @@ function buildMockGitLogStdout(
 }
 
 /**
- * Configures mockExecFile to handle both `git branch -r` and `git log` commands.
+ * Configures mockExecFile to handle `git branch -r`, `git rev-parse --verify`, and `git log`.
  */
-function setupGitCommandMocks(remoteBranchesOutput: string, logOutput: string): void {
+function setupGitCommandMocks(
+    remoteBranchesOutput: string,
+    logOutput: string,
+    validRefs: string[] = ['main', 'origin/main', 'master', 'origin/master', 'feature/estimativas', 'HEAD']
+): void {
+    // Step 4: Route git subcommands inside the mock so offline ref checks behave realistically.
     mockExecFile.mockImplementation((_cmd, args, _opts, callback) => {
         if (typeof callback !== 'function') {
             return;
@@ -97,12 +102,22 @@ function setupGitCommandMocks(remoteBranchesOutput: string, logOutput: string): 
             return;
         }
 
+        if (args[0] === 'rev-parse') {
+            const targetRef = args[args.length - 1] ?? '';
+            if (validRefs.includes(targetRef)) {
+                callback(null, `${targetRef}\n`, '');
+            } else {
+                callback(new Error(`fatal: Needed a single revision: ${targetRef}`), '', '');
+            }
+            return;
+        }
+
         callback(null, logOutput, '');
     });
 }
 
 describe('GitWorkHourEstimatorService', () => {
-    // Step 4: Use inferred spy return type so TypeScript does not reject generic spyOn arguments.
+    // Step 5: Use inferred spy return type so TypeScript does not reject generic spyOn arguments.
     let warnSpy: ReturnType<typeof jest.spyOn>;
 
     beforeEach(() => {
@@ -161,10 +176,10 @@ describe('GitWorkHourEstimatorService', () => {
         const service = new GitWorkHourEstimatorService();
         const items = await service.getWorkItems('/repo/exemplo');
 
-        expect(mockExecFile).toHaveBeenCalledTimes(2);
+        // Step 6: Assert `git log` uses the resolved `origin/main` ref.
         expect(mockExecFile).toHaveBeenCalledWith(
             'git',
-            expect.arrayContaining(['log', 'main', '--name-only', '--since=90 days ago']),
+            expect.arrayContaining(['log', 'origin/main', '--name-only', '--since=90 days ago']),
             expect.objectContaining({ cwd: '/repo/exemplo' }),
             expect.any(Function)
         );
@@ -203,7 +218,6 @@ describe('GitWorkHourEstimatorService', () => {
             branch: 'feature/estimativas',
         });
 
-        expect(mockExecFile).toHaveBeenCalledTimes(1);
         expect(mockExecFile).toHaveBeenCalledWith(
             'git',
             expect.arrayContaining([
@@ -215,6 +229,44 @@ describe('GitWorkHourEstimatorService', () => {
             ]),
             expect.objectContaining({ cwd: '/repo/exemplo' }),
             expect.any(Function)
+        );
+    });
+
+    /**
+     * Verifies that clean branch names (e.g. prod-v1.0) appear in metrics and Markdown reports
+     * even when git log internally resolves `origin/prod-v1.0`.
+     */
+    it('deve manter o nome limpo da branch nas métricas e no .md enquanto usa origin/<branch> no git log', async () => {
+        const stdout = buildMockGitLogStdout([
+            {
+                hash: 'p1',
+                authorName: 'Douglas',
+                authoredAt: '2026-11-12T10:00:00-03:00',
+                subject: 'feat: release prod-v1.0',
+                files: ['src/index.ts'],
+            },
+        ]);
+
+        setupGitCommandMocks('  origin/prod-v1.0\n  origin/main\n', stdout, ['origin/prod-v1.0']);
+
+        const service = new GitWorkHourEstimatorService();
+        const result = await service.estimateAndSaveMarkdown('/repo/dswebWeb', {
+            branch: 'origin/prod-v1.0',
+        });
+
+        expect(result.metrics.appliedFilters).toMatchObject({ branch: 'prod-v1.0' });
+        expect(mockExecFile).toHaveBeenCalledWith(
+            'git',
+            expect.arrayContaining(['log', 'origin/prod-v1.0']),
+            expect.objectContaining({ cwd: '/repo/dswebWeb' }),
+            expect.any(Function)
+        );
+
+        const expectedFile = join(resolve(process.cwd(), 'estimate', 'dswebWeb'), 'estimation.md');
+        expect(mockWriteFile).toHaveBeenCalledWith(
+            expectedFile,
+            expect.stringContaining('- **Branch:** prod-v1.0'),
+            'utf-8'
         );
     });
 

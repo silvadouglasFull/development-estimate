@@ -13,6 +13,15 @@ import { basename, resolve } from 'node:path';
 type EstimateOutputMode = 'markdown' | 'console';
 
 /**
+ * Stores the chosen branch alongside each processed repository URL.
+ */
+type RepoBranchSelection = {
+    repoUrl: string;
+    repoName: string;
+    branch: string;
+};
+
+/**
  * Extracts the local repository directory name from a repository URL.
  */
 function resolveRepoFolderName(repoUrl: string): string {
@@ -22,16 +31,40 @@ function resolveRepoFolderName(repoUrl: string): string {
 }
 
 /**
- * Main CLI orchestration function that lists GitHub repositories, clones selected ones
- * shallowly, and optionally generates Markdown reports or prints estimation objects.
+ * Lists branches for a repository via GitService and prompts the user to choose one.
+ */
+async function promptBranchForRepository(
+    gitService: GitService,
+    repoUrl: string,
+    repoName: string
+): Promise<string> {
+    // Step 1: List available branches for this repository.
+    const branches = await gitService.listBranches(repoUrl);
+    const options = branches.length > 0 ? branches : ['main'];
+    const defaultBranch = options.includes('main') ? 'main' : options[0];
+
+    // Step 2: Ask the user which branch to use for this specific repository.
+    return select<string>({
+        message: `Qual branch você deseja usar para o repositório "${repoName}"?`,
+        choices: options.map((branch) => ({
+            name: branch,
+            value: branch,
+        })),
+        default: defaultBranch,
+    });
+}
+
+/**
+ * Main CLI orchestration function that lists GitHub repositories, lists branches and
+ * prompts per repository, clones/updates them, and optionally generates estimates.
  */
 async function main() {
-    // Step 1: Instantiate GitHub, Git, and work-hour estimator services.
+    // Step 3: Instantiate GitHub, Git, and work-hour estimator services.
     const githubService = new GitHubService();
     const gitService = new GitService();
     const estimatorService = new GitWorkHourEstimatorService();
 
-    // Step 2: Fetch repositories from GitHub and stop early if none are found.
+    // Step 4: Fetch repositories from GitHub and stop early if none are found.
     console.log('Buscando repositórios no GitHub...');
     const repositories = await githubService.listRepositories();
 
@@ -40,7 +73,7 @@ async function main() {
         return;
     }
 
-    // Step 3: Prompt the user to select repositories to clone.
+    // Step 5: Prompt the user to select repositories to work with.
     const selectedUrls = await selectRepositories(repositories);
 
     if (selectedUrls.length === 0) {
@@ -48,41 +81,45 @@ async function main() {
         return;
     }
 
-    // Step 4: Ensure destination folder exists and clone each selected repository.
+    // Step 6: Ensure destination folder exists and ask branch per repository as we go.
     await gitService.ensureDestinationExists();
-    const clonedUrls: string[] = [];
+    const processedRepos: RepoBranchSelection[] = [];
 
     for (const repoUrl of selectedUrls) {
-        console.log(`\nClonando: ${repoUrl}...`);
+        const repoName = resolveRepoFolderName(repoUrl);
+        console.log(`\nListando branches de "${repoName}"...`);
 
         try {
-            await gitService.cloneShallow(repoUrl);
-            clonedUrls.push(repoUrl);
-            console.log(`Concluído: ${repoUrl}`);
+            const chosenBranch = await promptBranchForRepository(gitService, repoUrl, repoName);
+            console.log(`Clonando/atualizando "${repoName}" na branch "${chosenBranch}"...`);
+
+            await gitService.cloneShallow(repoUrl, chosenBranch);
+            processedRepos.push({ repoUrl, repoName, branch: chosenBranch });
+            console.log(`Concluído: ${repoName} (${chosenBranch})`);
         } catch (error) {
-            console.error(`Erro ao clonar ${repoUrl}:`, error);
+            console.error(`Erro ao processar ${repoName}:`, error);
         }
     }
 
-    if (clonedUrls.length === 0) {
-        console.log('\nNenhum repositório foi clonado com sucesso para estimativa.');
+    if (processedRepos.length === 0) {
+        console.log('\nNenhum repositório foi processado com sucesso para estimativa.');
         return;
     }
 
-    // Step 5: Ask whether to run hour estimates now that cloning has finished.
+    // Step 7: Ask whether to run hour estimates now that repositories are ready.
     const shouldEstimate = await confirm({
-        message: 'Deseja realizar as estimativas agora que os repositórios foram clonados? (Y/N)',
+        message: 'Deseja realizar as estimativas agora? (Y/N)',
         default: false,
     });
 
-    // Step 6: If the user answers N (false), say goodbye and exit cleanly.
+    // Step 8: If the user answers N (false), say goodbye and exit cleanly.
     if (!shouldEstimate) {
         console.log('\nTudo certo! Até a próxima e bom código!');
         process.exitCode = 0;
         return;
     }
 
-    // Step 7: Ask whether the user wants a .md file per repository or the object in console.
+    // Step 9: Ask whether the user wants a .md file per repository or the object in console.
     const outputMode = await select<EstimateOutputMode>({
         message: 'Como você deseja visualizar/gerar as estimativas de cada repositório?',
         choices: [
@@ -97,24 +134,24 @@ async function main() {
         ],
     });
 
-    // Step 8: Run estimation for each cloned repository in the chosen output format.
+    // Step 10: Run estimation for each repository using the branch chosen for that repository.
     const baseCloneDir = resolve(env.CLONE_DEST_DIR);
 
-    for (const repoUrl of clonedUrls) {
-        const repoName = resolveRepoFolderName(repoUrl);
-        const repoDir = resolve(baseCloneDir, repoName);
+    for (const repo of processedRepos) {
+        const repoDir = resolve(baseCloneDir, repo.repoName);
+        const filters = { branch: repo.branch };
 
         try {
             if (outputMode === 'markdown') {
-                const { filePath } = await estimatorService.estimateAndSaveMarkdown(repoDir);
-                console.log(`Arquivo .md gerado para ${repoName}: ${filePath}`);
+                const { filePath } = await estimatorService.estimateAndSaveMarkdown(repoDir, filters);
+                console.log(`Arquivo .md gerado para ${repo.repoName} (branch: ${repo.branch}): ${filePath}`);
             } else {
-                const metrics = await estimatorService.estimateFromRepository(repoDir);
-                console.log(`\nEstimativas para ${repoName}:`);
+                const metrics = await estimatorService.estimateFromRepository(repoDir, filters);
+                console.log(`\nEstimativas para ${repo.repoName} (branch: ${repo.branch}):`);
                 console.dir(metrics, { depth: null });
             }
         } catch (error) {
-            console.error(`Erro ao estimar ${repoName}:`, error);
+            console.error(`Erro ao estimar ${repo.repoName}:`, error);
         }
     }
 }
