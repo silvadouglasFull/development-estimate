@@ -28,20 +28,31 @@ export class LlmEstimatorAnalysisService {
     private readonly defaultChunkOverlap = 150;
 
     /**
+     * Builds a non-sensitive fingerprint of the active API key for debugging 401 errors.
+     */
+    private getKeyFingerprint(apiKey: string): string {
+        // Step 1: Expose only a short prefix, suffix, and length so secrets are never leaked.
+        if (apiKey.length <= 10) {
+            return `len=${apiKey.length}`;
+        }
+        return `${apiKey.slice(0, 6)}...${apiKey.slice(-4)} (len=${apiKey.length})`;
+    }
+
+    /**
      * Creates a LangChain chat model instance (OpenAI by default).
      */
     private createChatModel(): ChatOpenAI {
-        // Step 1: Validate API key presence before calling the LLM provider.
+        // Step 2: Validate and trim API key presence before calling the LLM provider.
         const apiKey = env.OPENAI_API_KEY?.trim();
         if (!apiKey) {
             throw new Error('OPENAI_API_KEY não configurada no ambiente (.env).');
         }
 
-        // Step 2: Instantiate ChatOpenAI via LangChain so swapping providers later stays isolated.
+        // Step 3: Instantiate ChatOpenAI via LangChain so swapping providers later stays isolated.
         return new ChatOpenAI({
             apiKey,
             model: env.OPENAI_MODEL,
-            temperature: 0.3,
+            temperature: 0.1,
         });
     }
 
@@ -49,7 +60,7 @@ export class LlmEstimatorAnalysisService {
      * Recursively collects Markdown (.md) files inside a repository directory.
      */
     private async collectRepoMarkdownFiles(dirPath: string): Promise<string[]> {
-        // Step 3: Walk subdirectories while ignoring .git and node_modules.
+        // Step 4: Walk subdirectories while ignoring .git and node_modules.
         const entries = await readdir(dirPath, { withFileTypes: true });
         const collected: string[] = [];
 
@@ -79,13 +90,13 @@ export class LlmEstimatorAnalysisService {
         chunkSize: number,
         chunkOverlap: number
     ): Promise<string[]> {
-        // Step 4: Return empty array when content has no non-whitespace characters.
+        // Step 5: Return empty array when content has no non-whitespace characters.
         const trimmed = markdownText.trim();
         if (!trimmed) {
             return [];
         }
 
-        // Step 5: Split Markdown text using MarkdownTextSplitter.
+        // Step 6: Split Markdown text using MarkdownTextSplitter.
         const splitter = new MarkdownTextSplitter({
             chunkSize: Math.max(200, chunkSize),
             chunkOverlap: Math.min(chunkOverlap, Math.floor(Math.max(200, chunkSize) / 4)),
@@ -102,13 +113,13 @@ export class LlmEstimatorAnalysisService {
         chunkSize: number,
         chunkOverlap: number
     ): Promise<string[]> {
-        // Step 6: Return empty array when text has no non-whitespace characters.
+        // Step 7: Return empty array when text has no non-whitespace characters.
         const trimmed = text.trim();
         if (!trimmed) {
             return [];
         }
 
-        // Step 7: Split text using RecursiveCharacterTextSplitter.
+        // Step 8: Split text using RecursiveCharacterTextSplitter.
         const splitter = new RecursiveCharacterTextSplitter({
             chunkSize: Math.max(200, chunkSize),
             chunkOverlap: Math.min(chunkOverlap, Math.floor(Math.max(200, chunkSize) / 4)),
@@ -125,7 +136,7 @@ export class LlmEstimatorAnalysisService {
         chunks: string[],
         maxBudgetChars: number
     ): { text: string; truncated: boolean } {
-        // Step 8: Accumulate chunks until adding the next chunk would exceed maxBudgetChars.
+        // Step 9: Accumulate chunks until adding the next chunk would exceed maxBudgetChars.
         if (chunks.length === 0 || maxBudgetChars <= 0) {
             return { text: '', truncated: chunks.length > 0 };
         }
@@ -140,7 +151,7 @@ export class LlmEstimatorAnalysisService {
                 continue;
             }
 
-            const separatorLength = includedChunks.length > 0 ? 2 : 0; // "\n\n"
+            const separatorLength = includedChunks.length > 0 ? 2 : 0;
             if (usedChars + separatorLength + cleanChunk.length <= maxBudgetChars) {
                 includedChunks.push(cleanChunk);
                 usedChars += separatorLength + cleanChunk.length;
@@ -165,7 +176,7 @@ export class LlmEstimatorAnalysisService {
         const maxTotalChars = params.maxTotalChars ?? this.defaultMaxTotalChars;
         const chunkOverlap = params.chunkOverlap ?? this.defaultChunkOverlap;
 
-        // Step 9: Read and chunk estimation.md using RecursiveCharacterTextSplitter.
+        // Step 10: Read and chunk estimation.md using RecursiveCharacterTextSplitter.
         const estimationContent = await readFile(params.estimateMarkdownPath, 'utf-8');
         const estimationChunks = await this.splitGeneralTextIntoChunks(
             estimationContent,
@@ -189,7 +200,7 @@ export class LlmEstimatorAnalysisService {
 
         let totalChars = parts.join('\n').length;
 
-        // Step 10: Collect repository `.md` files and join chunks up to maxTotalChars.
+        // Step 11: Collect repository `.md` files and join chunks up to maxTotalChars.
         const mdFiles = await this.collectRepoMarkdownFiles(params.repoDir);
 
         for (const filePath of mdFiles) {
@@ -239,28 +250,45 @@ export class LlmEstimatorAnalysisService {
      * Runs the LLM analysis and writes the resulting Markdown report to `estimate/<REPO>/analysis.md`.
      */
     public async generateAndSaveAnalysis(params: GenerateLlmAnalysisParams): Promise<string> {
-        // Step 11: Build prompt and send system + human messages via LangChain.
+        // Step 12: Build prompt and send system + human messages via LangChain.
         const model = this.createChatModel();
         const promptContent = await this.buildPromptContent(params);
 
-        const response = await model.invoke([
-            new SystemMessage(
-                [
-                    'Você é um especialista sênior em engenharia de software, arquitetura e estimativa de projetos.',
-                    'Analise os dados do histórico Git, as horas estimadas e a documentação Markdown do repositório',
-                    'à luz do objetivo e dos detalhes informados pelo usuário.',
-                    'Responda em português, de forma clara, prática e estruturada em Markdown.',
-                ].join(' ')
-            ),
-            new HumanMessage(promptContent),
-        ]);
+        let rawResponseContent: string;
 
-        const rawResponseContent =
-            typeof response.content === 'string'
-                ? response.content
-                : JSON.stringify(response.content, null, 2);
+        try {
+            const response = await model.invoke([
+                new SystemMessage(
+                    [
+                        'Você é um especialista sênior em engenharia de software, arquitetura e estimativa de projetos.',
+                        'Analise os dados do histórico Git, as horas estimadas e a documentação Markdown do repositório',
+                        'à luz do objetivo e dos detalhes informados pelo usuário.',
+                        'Responda em português, de forma clara, prática e estruturada em Markdown.',
+                    ].join(' ')
+                ),
+                new HumanMessage(promptContent),
+            ]);
 
-        // Step 12: Save output inside the same estimate/<REPO> folder as `analysis.md`.
+            rawResponseContent =
+                typeof response.content === 'string'
+                    ? response.content
+                    : JSON.stringify(response.content, null, 2);
+        } catch (error) {
+            // Step 13: Enrich 401/expired-key errors with model and safe key fingerprint details.
+            const apiKey = env.OPENAI_API_KEY?.trim() ?? '';
+            const fingerprint = this.getKeyFingerprint(apiKey);
+            const message = error instanceof Error ? error.message : String(error);
+
+            if (message.includes('401') || message.toLowerCase().includes('expired')) {
+                throw new Error(
+                    `Falha de autenticação (401) ao invocar o modelo "${env.OPENAI_MODEL}" com a chave [${fingerprint}]: a API rejeitou/expirou a chave. Verifique OPENAI_API_KEY no .env e confirme se não há outra chave antiga ativa no ambiente.`
+                );
+            }
+
+            throw error;
+        }
+
+        // Step 14: Save output inside the same estimate/<REPO> folder as `analysis.md`.
         const estimateDir = dirname(resolve(params.estimateMarkdownPath));
         const repoName = basename(estimateDir);
         const analysisFilePath = join(estimateDir, this.analysisFileName);
