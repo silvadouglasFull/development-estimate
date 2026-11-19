@@ -7,7 +7,7 @@ import type {
     WorkLogFilters,
 } from '@/types/work-hour-estimator.types';
 import { execFile } from 'node:child_process';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -254,40 +254,66 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
     }
 
     /**
-     * Creates estimate/<REPO_NAME> and writes a Markdown report containing the hour metrics.
+     * Checks if an estimate file already exists for the repository and logs a warning before overwriting.
+     */
+    private async warnIfEstimateExists(targetFile: string, repoName: string): Promise<void> {
+        // Step 8: Check file existence and emit a console warning if it will be overwritten.
+        try {
+            await access(targetFile);
+            console.warn(
+                `Aviso: já existe uma estimativa para o repositório "${repoName}" em "${targetFile}". O arquivo será sobrescrito.`
+            );
+        } catch {
+            // File does not exist yet; no warning needed.
+        }
+    }
+
+    /**
+     * Creates estimate/<REPO_NAME> and writes a Markdown report containing hour metrics and commit table.
      */
     public async saveEstimateMarkdown(
         repoDir: string,
         metrics: WorkHourMetrics,
+        commits: CommitWorkItem[] = [],
         outputRootDir: string = this.estimatesRootDir
     ): Promise<string> {
-        // Step 8: Resolve repository folder name and ensure target directory exists.
+        // Step 9: Resolve repository folder name and ensure target directory exists.
         const repoName = this.extractRepoName(repoDir);
         const targetDir = resolve(process.cwd(), outputRootDir, repoName);
         const targetFile = join(targetDir, this.reportFileName);
 
         await mkdir(targetDir, { recursive: true });
+        await this.warnIfEstimateExists(targetFile, repoName);
 
-        // Step 9: Build Markdown content and write it to disk.
-        const markdownContent = this.formatMarkdownReport(repoName, metrics);
+        // Step 10: Build Markdown content including the commit history table and write it to disk.
+        const markdownContent = this.formatMarkdownReport(repoName, metrics, commits);
         await writeFile(targetFile, markdownContent, 'utf-8');
 
         return targetFile;
     }
 
     /**
-     * Runs estimation for a repository and saves the resulting Markdown report to disk.
+     * Runs estimation for a repository and saves the resulting Markdown report with commit history.
      */
     public async estimateAndSaveMarkdown(
         repoDir: string,
         filters?: BranchWorkLogFilters,
         config: HourEstimationConfig = this.defaultConfig,
         outputRootDir: string = this.estimatesRootDir
-    ): Promise<{ metrics: WorkHourMetrics; filePath: string }> {
-        const metrics = await this.estimateFromRepository(repoDir, filters, config);
-        const filePath = await this.saveEstimateMarkdown(repoDir, metrics, outputRootDir);
+    ): Promise<{ metrics: WorkHourMetrics; filePath: string; commits: CommitWorkItem[] }> {
+        // Step 11: Resolve filters/branch, collect commit work items, compute metrics, and save report.
+        const resolvedFilters = this.resolveFilters(filters);
+        const resolvedBranch = await this.resolveTargetBranch(repoDir, resolvedFilters.branch);
+        const finalFilters: BranchWorkLogFilters = {
+            ...resolvedFilters,
+            branch: resolvedBranch,
+        };
 
-        return { metrics, filePath };
+        const commits = await this.getWorkItems(repoDir, finalFilters);
+        const metrics = this.calculateHourMetrics(commits, config, finalFilters);
+        const filePath = await this.saveEstimateMarkdown(repoDir, metrics, commits, outputRootDir);
+
+        return { metrics, filePath, commits };
     }
 
     /**
@@ -300,9 +326,40 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
     }
 
     /**
-     * Formats WorkHourMetrics into a clear Markdown summary for review or LLM input.
+     * Escapes pipe characters so commit authors and descriptions do not break Markdown tables.
      */
-    private formatMarkdownReport(repoName: string, metrics: WorkHourMetrics): string {
+    private escapeMarkdownCell(value: string): string {
+        return value.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim();
+    }
+
+    /**
+     * Formats commit work items as a Markdown table with author, description, and date columns.
+     */
+    private formatCommitHistoryTable(commits: CommitWorkItem[]): string {
+        if (commits.length === 0) {
+            return 'Nenhum commit encontrado no período.';
+        }
+
+        const header = '|autor|desc_commit|data|';
+        const divider = '|---|---|---|';
+        const rows = commits.map((commit) => {
+            const author = this.escapeMarkdownCell(commit.authorName);
+            const descCommit = this.escapeMarkdownCell(commit.subject);
+            const date = this.escapeMarkdownCell(commit.authoredAt);
+            return `|${author}|${descCommit}|${date}|`;
+        });
+
+        return [header, divider, ...rows].join('\n');
+    }
+
+    /**
+     * Formats WorkHourMetrics and commit history into a clear Markdown summary.
+     */
+    private formatMarkdownReport(
+        repoName: string,
+        metrics: WorkHourMetrics,
+        commits: CommitWorkItem[] = []
+    ): string {
         const branchName = (metrics.appliedFilters as BranchWorkLogFilters).branch ?? 'padrão';
         const prefixesLines =
             Object.keys(metrics.subjectPrefixes).length > 0
@@ -310,6 +367,8 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
                     .map(([prefix, count]) => `- **${prefix}**: ${count}`)
                     .join('\n')
                 : '- Nenhum commit encontrado no período';
+
+        const commitTable = this.formatCommitHistoryTable(commits);
 
         return [
             `# Estimativa de Horas — ${repoName}`,
@@ -334,6 +393,9 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
             '',
             '## Prefixos de Commit',
             prefixesLines,
+            '',
+            '## Histórico de Commits',
+            commitTable,
             '',
         ].join('\n');
     }
