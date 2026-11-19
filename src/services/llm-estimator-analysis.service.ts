@@ -6,25 +6,37 @@ import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 
 /**
- * Parameters required to generate an LLM analysis Markdown file for a repository.
+ * Represents a single analyzed project with its local clone path and generated estimation report.
  */
-export type GenerateLlmAnalysisParams = {
+export type AnalyzedProjectInput = {
+    projectName?: string;
     repoDir: string;
     estimateMarkdownPath: string;
+};
+
+/**
+ * Parameters required to generate a single consolidated `analysis.md` across multiple projects
+ * for the target project described by the user.
+ */
+export type GenerateConsolidatedAnalysisParams = {
+    projects: AnalyzedProjectInput[];
     userGoalAndDetails: string;
-    maxCharsPerFile?: number;
+    outputDir?: string;
+    includeRepoMarkdownDocs?: boolean;
+    maxCharsPerProject?: number;
     maxTotalChars?: number;
     chunkOverlap?: number;
 };
 
 /**
- * Service that uses LangChain (starting with OpenAI) to analyze repository hour estimates
- * and Markdown documentation against a user-provided goal, saving `analysis.md`.
+ * Service that uses LangChain (starting with OpenAI) to read hour estimates across multiple
+ * projects and generate a single consolidated `analysis.md` for the project described by the user.
  */
 export class LlmEstimatorAnalysisService {
     private readonly analysisFileName = 'analysis.md';
-    private readonly defaultMaxCharsPerFile = 4000;
-    private readonly defaultMaxTotalChars = 20000;
+    private readonly defaultEstimatesRootDir = 'estimate';
+    private readonly defaultMaxCharsPerProject = 5000;
+    private readonly defaultMaxTotalChars = 24000;
     private readonly defaultChunkOverlap = 150;
 
     /**
@@ -48,7 +60,7 @@ export class LlmEstimatorAnalysisService {
             throw new Error('OPENAI_API_KEY não configurada no ambiente (.env).');
         }
 
-        // Step 3: Instantiate ChatOpenAI via LangChain so swapping providers later stays isolated.
+        // Step 3: Instantiate ChatOpenAI via LangChain with low temperature for consistent estimates.
         return new ChatOpenAI({
             apiKey,
             model: env.OPENAI_MODEL,
@@ -168,91 +180,122 @@ export class LlmEstimatorAnalysisService {
     }
 
     /**
-     * Builds the prompt payload with the estimation report, repository Markdown files,
-     * and the user's goal/project details by joining splitter chunks up to the total limit.
+     * Builds a consolidated prompt containing the user's new project description and
+     * each analyzed project's `estimation.md` (plus optional repository `.md` docs).
      */
-    private async buildPromptContent(params: GenerateLlmAnalysisParams): Promise<string> {
-        const maxCharsPerFile = params.maxCharsPerFile ?? this.defaultMaxCharsPerFile;
+    private async buildConsolidatedPrompt(params: GenerateConsolidatedAnalysisParams): Promise<string> {
+        const maxCharsPerProject = params.maxCharsPerProject ?? this.defaultMaxCharsPerProject;
         const maxTotalChars = params.maxTotalChars ?? this.defaultMaxTotalChars;
         const chunkOverlap = params.chunkOverlap ?? this.defaultChunkOverlap;
+        const includeDocs = params.includeRepoMarkdownDocs ?? true;
 
-        // Step 10: Read and chunk estimation.md using RecursiveCharacterTextSplitter.
-        const estimationContent = await readFile(params.estimateMarkdownPath, 'utf-8');
-        const estimationChunks = await this.splitGeneralTextIntoChunks(
-            estimationContent,
-            maxCharsPerFile,
-            chunkOverlap
-        );
-        const joinedEstimation = this.joinChunksUpToBudget(
-            estimationChunks,
-            Math.max(1000, Math.floor(maxTotalChars * 0.4))
-        ).text;
-
-        const parts: string[] = [
-            '# Objetivo e Detalhes Informados pelo Usuário',
-            params.userGoalAndDetails.trim(),
+        const goalText = params.userGoalAndDetails.trim();
+        const headerParts: string[] = [
+            '# Projeto Novo Descrito pelo Usuário',
+            goalText,
             '',
-            '# Relatório de Estimativa de Horas (estimation.md)',
-            joinedEstimation,
-            '',
-            '# Arquivos Markdown do Repositório',
+            '# Projetos Analisados (Estimativas e Histórico)',
         ];
 
-        let totalChars = parts.join('\n').length;
+        let totalChars = headerParts.join('\n').length;
+        const projectSections: string[] = [];
 
-        // Step 11: Collect repository `.md` files and join chunks up to maxTotalChars.
-        const mdFiles = await this.collectRepoMarkdownFiles(params.repoDir);
-
-        for (const filePath of mdFiles) {
+        // Step 10: Read and chunk each project's estimation.md within a shared character budget.
+        for (const project of params.projects) {
             if (totalChars >= maxTotalChars) {
-                parts.push(
-                    '\n> Aviso: limite total de contexto atingido; demais arquivos .md foram omitidos.'
+                projectSections.push(
+                    '\n> Aviso: limite total de contexto atingido; demais projetos foram omitidos.'
                 );
                 break;
             }
 
-            const rawText = await readFile(filePath, 'utf-8');
-            const relPath = relative(params.repoDir, filePath);
+            const projectName =
+                project.projectName?.trim() ||
+                basename(dirname(resolve(project.estimateMarkdownPath))) ||
+                basename(resolve(project.repoDir));
 
-            const fileChunks = await this.splitMarkdownIntoChunks(rawText, 1200, chunkOverlap);
-            const remainingBudget = maxTotalChars - totalChars;
-            const fileBudget = Math.min(maxCharsPerFile, remainingBudget);
-
-            const { text: joinedFileText, truncated } = this.joinChunksUpToBudget(
-                fileChunks,
-                fileBudget
+            const estimationRaw = await readFile(project.estimateMarkdownPath, 'utf-8');
+            const estimationChunks = await this.splitGeneralTextIntoChunks(
+                estimationRaw,
+                1500,
+                chunkOverlap
             );
 
-            if (!joinedFileText) {
-                continue;
+            const remainingBudget = maxTotalChars - totalChars;
+            const perProjectBudget = Math.min(maxCharsPerProject, remainingBudget);
+            const estimationBudget = includeDocs
+                ? Math.floor(perProjectBudget * 0.7)
+                : perProjectBudget;
+
+            const joinedEstimation = this.joinChunksUpToBudget(
+                estimationChunks,
+                Math.max(500, estimationBudget)
+            ).text;
+
+            const sectionLines: string[] = [
+                `## Projeto: ${projectName}`,
+                '### Estimativa de Horas (estimation.md)',
+                joinedEstimation || '_Sem conteúdo em estimation.md._',
+            ];
+
+            // Step 11: Optionally attach repository Markdown excerpts inside the remaining project budget.
+            if (includeDocs) {
+                const usedSoFar = sectionLines.join('\n').length;
+                let docBudgetLeft = Math.max(0, perProjectBudget - usedSoFar);
+                const mdFiles = await this.collectRepoMarkdownFiles(project.repoDir);
+
+                for (const mdFile of mdFiles) {
+                    if (docBudgetLeft < 300) {
+                        break;
+                    }
+
+                    const docText = await readFile(mdFile, 'utf-8');
+                    const docChunks = await this.splitMarkdownIntoChunks(docText, 1000, chunkOverlap);
+                    const joinedDoc = this.joinChunksUpToBudget(
+                        docChunks,
+                        Math.min(1800, docBudgetLeft)
+                    ).text;
+
+                    if (!joinedDoc) {
+                        continue;
+                    }
+
+                    const relDocPath = relative(project.repoDir, mdFile);
+                    const docBlock = [
+                        `#### Doc (${relDocPath})`,
+                        '```markdown',
+                        joinedDoc,
+                        '```',
+                    ].join('\n');
+
+                    sectionLines.push(docBlock);
+                    docBudgetLeft -= docBlock.length;
+                }
             }
 
-            const contentWithNotice = truncated
-                ? `${joinedFileText}\n\n[...trechos adicionais omitidos para respeitar o limite...]`
-                : joinedFileText;
-
-            const section = [
-                `## Arquivo: ${relPath}`,
-                '```markdown',
-                contentWithNotice,
-                '```',
-                '',
-            ].join('\n');
-
-            parts.push(section);
-            totalChars += section.length;
+            const fullSection = sectionLines.join('\n\n');
+            projectSections.push(fullSection);
+            totalChars += fullSection.length;
         }
 
-        return parts.join('\n');
+        return [...headerParts, '', ...projectSections].join('\n\n');
     }
 
     /**
-     * Runs the LLM analysis and writes the resulting Markdown report to `estimate/<REPO>/analysis.md`.
+     * Reads `estimation.md` for every provided project, runs a single consolidated LLM analysis
+     * for the project described by the user, and writes one `analysis.md` file.
      */
-    public async generateAndSaveAnalysis(params: GenerateLlmAnalysisParams): Promise<string> {
-        // Step 12: Build prompt and send system + human messages via LangChain.
+    public async generateConsolidatedAnalysis(
+        params: GenerateConsolidatedAnalysisParams
+    ): Promise<string> {
+        if (params.projects.length === 0) {
+            throw new Error('Nenhum projeto informado para análise consolidada.');
+        }
+
+        // Step 12: Build consolidated prompt and invoke LLM once across all analyzed projects.
         const model = this.createChatModel();
-        const promptContent = await this.buildPromptContent(params);
+        const promptContent = await this.buildConsolidatedPrompt(params);
+        const goalText = params.userGoalAndDetails.trim();
 
         let rawResponseContent: string;
 
@@ -261,9 +304,14 @@ export class LlmEstimatorAnalysisService {
                 new SystemMessage(
                     [
                         'Você é um especialista sênior em engenharia de software, arquitetura e estimativa de projetos.',
-                        'Analise os dados do histórico Git, as horas estimadas e a documentação Markdown do repositório',
-                        'à luz do objetivo e dos detalhes informados pelo usuário.',
-                        'Responda em português, de forma clara, prática e estruturada em Markdown.',
+                        'Você receberá os relatórios de estimativa (estimation.md) e referências de vários projetos já analisados',
+                        'junto com a descrição de um novo projeto informado pelo usuário.',
+                        'Comece a resposta exatamente com a frase introdutória:',
+                        `"Com base nos seus projetos que foram analisados, essa é minha analise sobre custo e tempo para desenvolver um projeto como você descreveu: ${goalText}"`,
+                        'Em seguida, compare com os projetos analisados e apresente de forma clara e prática em Markdown:',
+                        '1) Estimativa de tempo (horas e dias úteis considerando o ritmo informado),',
+                        '2) Estimativa/estrutura de custo ou cobrança,',
+                        '3) Riscos, premissas e o que faz o tempo/custo subir ou cair.',
                     ].join(' ')
                 ),
                 new HumanMessage(promptContent),
@@ -288,20 +336,28 @@ export class LlmEstimatorAnalysisService {
             throw error;
         }
 
-        // Step 14: Save output inside the same estimate/<REPO> folder as `analysis.md`.
-        const estimateDir = dirname(resolve(params.estimateMarkdownPath));
-        const repoName = basename(estimateDir);
-        const analysisFilePath = join(estimateDir, this.analysisFileName);
+        // Step 14: Write a single consolidated analysis.md file in the target output directory.
+        const targetDir = resolve(params.outputDir ?? this.defaultEstimatesRootDir);
+        const analysisFilePath = join(targetDir, this.analysisFileName);
 
-        await mkdir(estimateDir, { recursive: true });
+        await mkdir(targetDir, { recursive: true });
+
+        const analyzedNames = params.projects.map(
+            (project) =>
+                project.projectName?.trim() ||
+                basename(dirname(resolve(project.estimateMarkdownPath))) ||
+                basename(resolve(project.repoDir))
+        );
 
         const finalMarkdown = [
-            `# Análise de Estimativa com LLM — ${repoName}`,
+            '# Análise Consolidada de Custo e Tempo',
             '',
-            '## Objetivo Informado',
-            params.userGoalAndDetails.trim(),
+            `**Projetos analisados:** ${analyzedNames.join(', ')}`,
             '',
-            '## Parecer Técnico',
+            '## Projeto Descrito',
+            goalText,
+            '',
+            '## Análise Consolidada',
             rawResponseContent.trim(),
             '',
         ].join('\n');

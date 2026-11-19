@@ -111,7 +111,7 @@ describe('LlmEstimatorAnalysisService', () => {
         mockMarkdownSplitter.mockImplementation((opts) => createSliceSplitter(opts));
         mockRecursiveSplitter.mockImplementation((opts) => createSliceSplitter(opts));
         mockInvoke.mockResolvedValue({
-            content: '### Resumo da Análise\nEstimativa coerente com o escopo descrito.',
+            content: '### Estimativa Consolidada\nPrazo estimado em poucos dias a 4h/dia.',
         });
         mockChatOpenAI.mockImplementation(() => ({
             invoke: mockInvoke,
@@ -119,7 +119,7 @@ describe('LlmEstimatorAnalysisService', () => {
     });
 
     /**
-     * Verifies that generateAndSaveAnalysis throws an error when OPENAI_API_KEY is missing.
+     * Verifies that generateConsolidatedAnalysis throws an error when OPENAI_API_KEY is missing.
      */
     it('deve lançar erro se OPENAI_API_KEY não estiver configurada', async () => {
         fakeEnv.OPENAI_API_KEY = '';
@@ -128,9 +128,14 @@ describe('LlmEstimatorAnalysisService', () => {
         const estimatePath = resolve('/workspace/estimate/meu-repo/estimation.md');
 
         await expect(
-            service.generateAndSaveAnalysis({
-                repoDir: '/repos/meu-repo',
-                estimateMarkdownPath: estimatePath,
+            service.generateConsolidatedAnalysis({
+                projects: [
+                    {
+                        projectName: 'meu-repo',
+                        repoDir: '/repos/meu-repo',
+                        estimateMarkdownPath: estimatePath,
+                    },
+                ],
                 userGoalAndDetails: 'Estimar novo projeto semelhante',
             })
         ).rejects.toThrow('OPENAI_API_KEY não configurada no ambiente (.env).');
@@ -140,131 +145,151 @@ describe('LlmEstimatorAnalysisService', () => {
     });
 
     /**
-     * Verifies that generateAndSaveAnalysis reads estimation.md and repo Markdown files,
-     * invokes the mocked LangChain model once, and saves analysis.md in estimate/<REPO>.
+     * Verifies that generateConsolidatedAnalysis throws when no projects are supplied.
      */
-    it('deve gerar analysis.md com a resposta simulada do LLM sem chamar API real', async () => {
-        const repoDir = '/repos/dswebWeb';
-        const estimatePath = resolve('/workspace/estimate/dswebWeb/estimation.md');
-        const expectedAnalysisPath = join(resolve('/workspace/estimate/dswebWeb'), 'analysis.md');
+    it('deve lançar erro quando nenhum projeto for informado', async () => {
+        const service = new LlmEstimatorAnalysisService();
+
+        await expect(
+            service.generateConsolidatedAnalysis({
+                projects: [],
+                userGoalAndDetails: 'Landing page de produto',
+            })
+        ).rejects.toThrow('Nenhum projeto informado para análise consolidada.');
+
+        expect(mockInvoke).not.toHaveBeenCalled();
+        expect(mockWriteFile).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Verifies that generateConsolidatedAnalysis reads estimation.md across multiple projects,
+     * invokes the mocked LangChain model once, and saves a single consolidated analysis.md.
+     */
+    it('deve analisar múltiplos estimation.md e gerar um único analysis.md consolidado', async () => {
+        const outputDir = '/workspace/estimate';
+        const repoA = '/repos/dswebWeb';
+        const estimateA = resolve('/workspace/estimate/dswebWeb/estimation.md');
+        const repoB = '/repos/imaginacaoArteWeb';
+        const estimateB = resolve('/workspace/estimate/imaginacaoArteWeb/estimation.md');
+        const expectedAnalysisPath = join(resolve(outputDir), 'analysis.md');
 
         mockReadFile.mockImplementation(async (targetPath: string) => {
-            if (targetPath === estimatePath) {
-                return '# Estimativa de Horas — dswebWeb\n- **Base:** 10h';
+            if (targetPath === estimateA) {
+                return '# Estimativa de Horas — dswebWeb\n- **Base:** 12h';
             }
-            if (targetPath === join(repoDir, 'README.md')) {
-                return '# DSWeb Web\nSistema web institucional.';
+            if (targetPath === estimateB) {
+                return '# Estimativa de Horas — imaginacaoArteWeb\n- **Base:** 8h';
             }
-            if (targetPath === join(repoDir, 'docs/guia.md')) {
-                return '# Guia\nDetalhes de deploy.';
+            if (targetPath === join(repoA, 'README.md')) {
+                return '# DSWeb Web\nSite institucional e landing pages.';
             }
             return '';
         });
 
         mockReaddir.mockImplementation(async (dirPath: string) => {
-            if (dirPath === repoDir) {
+            if (dirPath === repoA) {
                 return [
                     makeDirent('.git', 'directory'),
                     makeDirent('node_modules', 'directory'),
-                    makeDirent('docs', 'directory'),
                     makeDirent('README.md', 'file'),
-                    makeDirent('package.json', 'file'),
                 ];
-            }
-            if (dirPath === join(repoDir, 'docs')) {
-                return [makeDirent('guia.md', 'file')];
             }
             return [];
         });
 
-        const service = new LlmEstimatorAnalysisService();
-        const savedPath = await service.generateAndSaveAnalysis({
-            repoDir,
-            estimateMarkdownPath: estimatePath,
-            userGoalAndDetails: 'Quero criar um novo projeto parecido e estimar prazo e valor.',
+        let capturedHumanPrompt = '';
+        mockInvoke.mockImplementation(async (messages: unknown[]) => {
+            const msgList = messages as Array<{ content?: unknown }>;
+            capturedHumanPrompt = typeof msgList[1]?.content === 'string' ? msgList[1].content : '';
+            return { content: '### Estimativa Consolidada\nPrazo estimado em poucos dias a 4h/dia.' };
         });
 
-        // Step 7: Verify output file path, splitter usage, single mocked LLM call, and saved Markdown.
+        const service = new LlmEstimatorAnalysisService();
+        const goalText = 'Landing page enxuta para divulgar um novo boné e clicar em Comprar agora.';
+
+        const savedPath = await service.generateConsolidatedAnalysis({
+            projects: [
+                { projectName: 'dswebWeb', repoDir: repoA, estimateMarkdownPath: estimateA },
+                {
+                    projectName: 'imaginacaoArteWeb',
+                    repoDir: repoB,
+                    estimateMarkdownPath: estimateB,
+                },
+            ],
+            userGoalAndDetails: goalText,
+            outputDir,
+        });
+
+        // Step 7: Verify single consolidated output file, prompt contents from both projects, and single LLM call.
         expect(savedPath).toBe(expectedAnalysisPath);
-        expect(mockRecursiveSplitter).toHaveBeenCalledTimes(1);
-        expect(mockMarkdownSplitter).toHaveBeenCalledTimes(2);
         expect(mockChatOpenAI).toHaveBeenCalledTimes(1);
         expect(mockInvoke).toHaveBeenCalledTimes(1);
-        expect(mockMkdir).toHaveBeenCalledWith(resolve('/workspace/estimate/dswebWeb'), {
-            recursive: true,
-        });
+        expect(capturedHumanPrompt).toContain('## Projeto: dswebWeb');
+        expect(capturedHumanPrompt).toContain('## Projeto: imaginacaoArteWeb');
+        expect(capturedHumanPrompt).toContain('Base:** 12h');
+        expect(capturedHumanPrompt).toContain('Base:** 8h');
+        expect(mockMkdir).toHaveBeenCalledWith(resolve(outputDir), { recursive: true });
+        expect(mockWriteFile).toHaveBeenCalledTimes(1);
         expect(mockWriteFile).toHaveBeenCalledWith(
             expectedAnalysisPath,
-            expect.stringContaining('# Análise de Estimativa com LLM — dswebWeb'),
+            expect.stringContaining('# Análise Consolidada de Custo e Tempo'),
             'utf-8'
         );
         expect(mockWriteFile).toHaveBeenCalledWith(
             expectedAnalysisPath,
-            expect.stringContaining('Quero criar um novo projeto parecido e estimar prazo e valor.'),
+            expect.stringContaining('**Projetos analisados:** dswebWeb, imaginacaoArteWeb'),
             'utf-8'
         );
         expect(mockWriteFile).toHaveBeenCalledWith(
             expectedAnalysisPath,
-            expect.stringContaining('Estimativa coerente com o escopo descrito.'),
+            expect.stringContaining(goalText),
             'utf-8'
         );
     });
 
     /**
-     * Verifies that chunks are joined up to maxCharsPerFile and remaining chunks are omitted cleanly.
+     * Verifies that character budgets per project are respected when estimation reports are large.
      */
-    it('deve juntar trechos até maxCharsPerFile e sinalizar quando houver trechos omitidos', async () => {
-        const repoDir = '/repos/doc-pesada';
-        const estimatePath = resolve('/workspace/estimate/doc-pesada/estimation.md');
+    it('deve respeitar o limite de caracteres por projeto ao consolidar estimativas grandes', async () => {
+        const outputDir = '/workspace/estimate';
+        const repoDir = '/repos/projeto-longo';
+        const estimatePath = resolve('/workspace/estimate/projeto-longo/estimation.md');
 
-        // Step 8: Use distinct markers so we confirm multiple chunks are joined and excess is omitted.
-        const chunkA = 'A'.repeat(200);
-        const chunkB = 'B'.repeat(200);
-        const chunkC = 'C'.repeat(200);
+        const longBlockA = 'A'.repeat(600);
+        const longBlockB = 'B'.repeat(600);
 
-        mockMarkdownSplitter.mockImplementation(() => ({
-            splitText: async () => [chunkA, chunkB, chunkC],
+        mockRecursiveSplitter.mockImplementation(() => ({
+            splitText: async () => [longBlockA, longBlockB],
         }));
 
         mockReadFile.mockImplementation(async (targetPath: string) => {
             if (targetPath === estimatePath) {
-                return 'Resumo da estimativa';
-            }
-            if (targetPath === join(repoDir, 'README.md')) {
-                return `${chunkA}${chunkB}${chunkC}`;
+                return `${longBlockA}${longBlockB}`;
             }
             return '';
         });
 
-        mockReaddir.mockImplementation(async (dirPath: string) => {
-            if (dirPath === repoDir) {
-                return [makeDirent('README.md', 'file')];
-            }
-            return [];
-        });
-
-        let capturedPromptText = '';
+        let capturedPrompt = '';
         mockInvoke.mockImplementation(async (messages: unknown[]) => {
             const msgList = messages as Array<{ content?: unknown }>;
-            const humanMsg = msgList[1];
-            capturedPromptText = typeof humanMsg?.content === 'string' ? humanMsg.content : '';
-            return { content: 'Análise com trechos agrupados.' };
+            capturedPrompt = typeof msgList[1]?.content === 'string' ? msgList[1].content : '';
+            return { content: 'Análise respeitando limite de contexto.' };
         });
 
         const service = new LlmEstimatorAnalysisService();
-        await service.generateAndSaveAnalysis({
-            repoDir,
-            estimateMarkdownPath: estimatePath,
-            userGoalAndDetails: 'Avaliar esforço de documentação',
-            maxCharsPerFile: 450,
-            maxTotalChars: 5000,
+        await service.generateConsolidatedAnalysis({
+            projects: [
+                { projectName: 'projeto-longo', repoDir, estimateMarkdownPath: estimatePath },
+            ],
+            userGoalAndDetails: 'Estimar nova landing page',
+            includeRepoMarkdownDocs: false,
+            maxCharsPerProject: 800,
+            maxTotalChars: 3000,
         });
 
-        expect(capturedPromptText).toContain(chunkA);
-        expect(capturedPromptText).toContain(chunkB);
-        expect(capturedPromptText).not.toContain(chunkC);
-        expect(capturedPromptText).toContain(
-            '[...trechos adicionais omitidos para respeitar o limite...]'
-        );
+        // Step 8: With maxCharsPerProject = 800 and 70% estimation budget (~560 chars),
+        // only the first 600-char chunk (or capped slice) fits while the second chunk is excluded.
+        expect(capturedPrompt).toContain(longBlockA);
+        expect(capturedPrompt).not.toContain(longBlockB);
     });
 });
