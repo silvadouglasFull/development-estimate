@@ -1,5 +1,5 @@
 {
-  "name": "development -estimate",
+  "name": "development-estimate",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -40,6 +40,7 @@
     "@inquirer/prompts": "^8.8.0",
     "@langchain/core": "^1.4.1",
     "@langchain/openai": "^1.8.4",
+    "@langchain/textsplitters": "^1.0.2",
     "octokit": "^5.0.5",
     "zod": "^4.6.7"
   }
