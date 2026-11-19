@@ -8,14 +8,18 @@ export type CommitWorkItem = {
     subject: string;
     filesChanged: string[];
 };
-
 /**
- * Filter parameters used to narrow down git log history.
+ * Filter parameters used to narrow down git log history and select a target branch.
  */
 export type WorkLogFilters = {
+    // Step 1: Optional start date or relative window (e.g. "1 year ago").
     since?: string;
+    // Step 2: Optional end date filter for git log.
     until?: string;
+    // Step 3: Optional commit author filter.
     author?: string;
+    // Step 4: Optional target branch name to inspect and report.
+    branch?: string;
 };
 
 /**

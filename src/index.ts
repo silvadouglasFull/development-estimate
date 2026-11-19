@@ -3,8 +3,12 @@ import { env } from '@/env';
 import { GitWorkHourEstimatorService } from '@/services/git-work-hour.service';
 import { GitService } from '@/services/git.service';
 import { GitHubService } from '@/services/github.service';
+import {
+    type AnalyzedProjectInput,
+    LlmEstimatorAnalysisService,
+} from '@/services/llm-estimator-analysis.service';
 import { ExitPromptError } from '@inquirer/core';
-import { confirm, select } from '@inquirer/prompts';
+import { confirm, input, select } from '@inquirer/prompts';
 import { basename, resolve } from 'node:path';
 
 /**
@@ -25,6 +29,7 @@ type RepoBranchSelection = {
  * Extracts the local repository directory name from a repository URL.
  */
 function resolveRepoFolderName(repoUrl: string): string {
+    // Step 1: Strip trailing .git and extract the last path or SCP-style segment.
     const cleanUrl = repoUrl.split('/').pop() ?? repoUrl;
     const repoPart = cleanUrl.split(':').pop() ?? cleanUrl;
     return basename(repoPart, '.git');
@@ -38,12 +43,12 @@ async function promptBranchForRepository(
     repoUrl: string,
     repoName: string
 ): Promise<string> {
-    // Step 1: List available branches for this repository.
+    // Step 2: List available branches for this repository.
     const branches = await gitService.listBranches(repoUrl);
     const options = branches.length > 0 ? branches : ['main'];
     const defaultBranch = options.includes('main') ? 'main' : options[0];
 
-    // Step 2: Ask the user which branch to use for this specific repository.
+    // Step 3: Ask the user which branch to use for this specific repository.
     return select<string>({
         message: `Qual branch você deseja usar para o repositório "${repoName}"?`,
         choices: options.map((branch) => ({
@@ -56,15 +61,17 @@ async function promptBranchForRepository(
 
 /**
  * Main CLI orchestration function that lists GitHub repositories, lists branches and
- * prompts per repository, clones/updates them, and optionally generates estimates.
+ * prompts per repository, clones/updates them, generates estimates, and runs a single
+ * consolidated LLM analysis across all analyzed projects when requested.
  */
 async function main() {
-    // Step 3: Instantiate GitHub, Git, and work-hour estimator services.
+    // Step 4: Instantiate GitHub, Git, work-hour estimator, and LLM analysis services.
     const githubService = new GitHubService();
     const gitService = new GitService();
     const estimatorService = new GitWorkHourEstimatorService();
+    const llmAnalysisService = new LlmEstimatorAnalysisService();
 
-    // Step 4: Fetch repositories from GitHub and stop early if none are found.
+    // Step 5: Fetch repositories from GitHub and stop early if none are found.
     console.log('Buscando repositórios no GitHub...');
     const repositories = await githubService.listRepositories();
 
@@ -73,7 +80,7 @@ async function main() {
         return;
     }
 
-    // Step 5: Prompt the user to select repositories to work with.
+    // Step 6: Prompt the user to select repositories to work with.
     const selectedUrls = await selectRepositories(repositories);
 
     if (selectedUrls.length === 0) {
@@ -81,7 +88,7 @@ async function main() {
         return;
     }
 
-    // Step 6: Ensure destination folder exists and ask branch per repository as we go.
+    // Step 7: Ensure destination folder exists and ask branch per repository as we go.
     await gitService.ensureDestinationExists();
     const processedRepos: RepoBranchSelection[] = [];
 
@@ -106,20 +113,20 @@ async function main() {
         return;
     }
 
-    // Step 7: Ask whether to run hour estimates now that repositories are ready.
+    // Step 8: Ask whether to run hour estimates now that repositories are ready.
     const shouldEstimate = await confirm({
         message: 'Deseja realizar as estimativas agora? (Y/N)',
         default: false,
     });
 
-    // Step 8: If the user answers N (false), say goodbye and exit cleanly.
+    // Step 9: If the user answers N (false), say goodbye and exit cleanly.
     if (!shouldEstimate) {
         console.log('\nTudo certo! Até a próxima e bom código!');
         process.exitCode = 0;
         return;
     }
 
-    // Step 9: Ask whether the user wants a .md file per repository or the object in console.
+    // Step 10: Ask whether the user wants a .md file per repository or the object in console.
     const outputMode = await select<EstimateOutputMode>({
         message: 'Como você deseja visualizar/gerar as estimativas de cada repositório?',
         choices: [
@@ -134,8 +141,25 @@ async function main() {
         ],
     });
 
-    // Step 10: Run estimation for each repository using the branch chosen for that repository.
+    // Step 11: Ask whether the LLM should perform a consolidated analysis; if yes, ask goal and details.
+    const shouldRunLlmAnalysis = await confirm({
+        message: 'Deseja que o LLM faça uma análise sobre essas estimativas? (Y/N)',
+        default: false,
+    });
+
+    let userGoalAndDetails = '';
+    if (shouldRunLlmAnalysis) {
+        userGoalAndDetails = await input({
+            message:
+                'Qual o objetivo da análise? (Ex.: você quer criar um novo projeto e estimar quanto cobrar ou quanto tempo levaria para executar esse projeto? Se sim, me fale sobre o projeto e dê o maior número de detalhes):',
+            validate: (value) =>
+                value.trim().length > 0 || 'Por favor, informe o objetivo e os detalhes do projeto.',
+        });
+    }
+
+    // Step 12: Generate estimation.md for each repository and collect inputs for consolidated LLM analysis.
     const baseCloneDir = resolve(env.CLONE_DEST_DIR);
+    const analyzedProjects: AnalyzedProjectInput[] = [];
 
     for (const repo of processedRepos) {
         const repoDir = resolve(baseCloneDir, repo.repoName);
@@ -144,15 +168,44 @@ async function main() {
         try {
             if (outputMode === 'markdown') {
                 const { filePath } = await estimatorService.estimateAndSaveMarkdown(repoDir, filters);
-                console.log(`Arquivo .md gerado para ${repo.repoName} (branch: ${repo.branch}): ${filePath}`);
+                console.log(
+                    `Arquivo .md gerado para ${repo.repoName} (branch: ${repo.branch}): ${filePath}`
+                );
+                analyzedProjects.push({
+                    projectName: repo.repoName,
+                    repoDir,
+                    estimateMarkdownPath: filePath,
+                });
             } else {
                 const metrics = await estimatorService.estimateFromRepository(repoDir, filters);
                 console.log(`\nEstimativas para ${repo.repoName} (branch: ${repo.branch}):`);
                 console.dir(metrics, { depth: null });
+
+                if (shouldRunLlmAnalysis) {
+                    const savedEstimatePath = await estimatorService.saveEstimateMarkdown(
+                        repoDir,
+                        metrics
+                    );
+                    analyzedProjects.push({
+                        projectName: repo.repoName,
+                        repoDir,
+                        estimateMarkdownPath: savedEstimatePath,
+                    });
+                }
             }
         } catch (error) {
-            console.error(`Erro ao estimar ${repo.repoName}:`, error);
+            console.error(`Erro ao processar ${repo.repoName}:`, error);
         }
+    }
+
+    // Step 13: Run a single consolidated LLM analysis across all analyzed projects when requested.
+    if (shouldRunLlmAnalysis && analyzedProjects.length > 0) {
+        console.log('\nGerando análise consolidada com LLM para o projeto informado...');
+        const consolidatedAnalysisPath = await llmAnalysisService.generateConsolidatedAnalysis({
+            projects: analyzedProjects,
+            userGoalAndDetails,
+        });
+        console.log(`Análise consolidada salva em: ${consolidatedAnalysisPath}`);
     }
 }
 

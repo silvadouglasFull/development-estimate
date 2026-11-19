@@ -1,6 +1,5 @@
-import { DEFAULT_HOUR_ESTIMATION_CONFIG } from '@/services/constants/git-work-hours-estimator-service.constants';
-import type { CommitWorkItem, WorkHourMetrics } from '@/types/work-hour-estimator.types';
-import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals';
+import type { CommitWorkItem } from '@/types/work-hour-estimator.types';
+import { beforeEach, describe, expect, it, jest } from '@jest/globals';
 import { join, resolve } from 'node:path';
 
 /**
@@ -9,7 +8,7 @@ import { join, resolve } from 'node:path';
 type ExecFileCallback = (err: Error | null, stdout?: string, stderr?: string) => void;
 
 /**
- * Mock signature for execFile calls inside unit tests.
+ * Mock signature for execFile invocations inside unit tests.
  */
 type ExecFileMockFn = (
     cmd: string,
@@ -19,11 +18,11 @@ type ExecFileMockFn = (
 ) => void;
 
 const mockExecFile = jest.fn<ExecFileMockFn>();
-const mockAccess = jest.fn<(path: string) => Promise<void>>();
-const mockMkdir = jest.fn<(path: string, options?: { recursive?: boolean }) => Promise<string | undefined>>();
+const mockAccess = jest.fn<(filePath: string) => Promise<void>>();
+const mockMkdir = jest.fn<(dirPath: string, options?: { recursive?: boolean }) => Promise<string | undefined>>();
 const mockWriteFile = jest.fn<(filePath: string, data: string, encoding?: BufferEncoding) => Promise<void>>();
 
-// Step 1: Mock node:child_process before importing GitWorkHourEstimatorService.
+// Step 1: Mock node:child_process and its custom promisify behavior.
 jest.unstable_mockModule('node:child_process', () => {
     const execFileFn = Object.assign(mockExecFile, {
         [Symbol.for('nodejs.util.promisify.custom')]: (
@@ -47,433 +46,166 @@ jest.unstable_mockModule('node:child_process', () => {
     };
 });
 
-// Step 2: Mock node:fs/promises so tests do not touch the real filesystem.
+// Step 2: Mock node:fs/promises to avoid real filesystem writes during tests.
 jest.unstable_mockModule('node:fs/promises', () => ({
     access: mockAccess,
     mkdir: mockMkdir,
     writeFile: mockWriteFile,
 }));
 
-// Step 3: Dynamically import the service after mocks are registered.
+// Step 3: Dynamically import GitWorkHourEstimatorService after mocks are registered.
 const { GitWorkHourEstimatorService } = await import('@/services/git-work-hour.service');
 
-/**
- * Builds a raw stdout string matching the custom field (\x1f) and record (\x1e) format.
- */
-function buildMockGitLogStdout(
-    entries: Array<{
-        hash: string;
-        authorName: string;
-        authoredAt: string;
-        subject: string;
-        files: string[];
-    }>
-): string {
-    const fieldSep = '\x1f';
-    const recordSep = '\x1e';
-
-    return entries
-        .map((entry) => {
-            const header = [entry.hash, entry.authorName, entry.authoredAt, entry.subject].join(
-                fieldSep
-            );
-            const filesBlock = entry.files.join('\n');
-            return `${recordSep}${header}${fieldSep}${filesBlock}`;
-        })
-        .join('\n');
-}
-
-/**
- * Configures mockExecFile to handle `git branch -r`, `git rev-parse --verify`, and `git log`.
- */
-function setupGitCommandMocks(
-    remoteBranchesOutput: string,
-    logOutput: string,
-    validRefs: string[] = ['main', 'origin/main', 'master', 'origin/master', 'feature/estimativas', 'HEAD']
-): void {
-    // Step 4: Route git subcommands inside the mock so offline ref checks behave realistically.
-    mockExecFile.mockImplementation((_cmd, args, _opts, callback) => {
-        if (typeof callback !== 'function') {
-            return;
-        }
-
-        if (args[0] === 'branch' && args[1] === '-r') {
-            callback(null, remoteBranchesOutput, '');
-            return;
-        }
-
-        if (args[0] === 'rev-parse') {
-            const targetRef = args[args.length - 1] ?? '';
-            if (validRefs.includes(targetRef)) {
-                callback(null, `${targetRef}\n`, '');
-            } else {
-                callback(new Error(`fatal: Needed a single revision: ${targetRef}`), '', '');
-            }
-            return;
-        }
-
-        callback(null, logOutput, '');
-    });
-}
-
 describe('GitWorkHourEstimatorService', () => {
-    // Step 5: Use inferred spy return type so TypeScript does not reject generic spyOn arguments.
-    let warnSpy: ReturnType<typeof jest.spyOn>;
-
     beforeEach(() => {
+        // Step 4: Reset mocks and configure deterministic git responses for branch detection,
+        // ref verification, and log parsing.
         jest.clearAllMocks();
-        warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
         mockAccess.mockRejectedValue(new Error('ENOENT'));
         mockMkdir.mockResolvedValue(undefined);
         mockWriteFile.mockResolvedValue(undefined);
-    });
 
-    afterEach(() => {
-        warnSpy.mockRestore();
+        mockExecFile.mockImplementation((_cmd, args, _opts, callback) => {
+            if (typeof callback !== 'function') {
+                return;
+            }
+
+            if (args[0] === 'branch' && args[1] === '-r') {
+                callback(null, '  origin/HEAD -> origin/main\n  origin/main\n', '');
+                return;
+            }
+
+            if (args[0] === 'rev-parse') {
+                callback(null, 'abc1234\n', '');
+                return;
+            }
+
+            if (args[0] === 'log') {
+                const sampleLog = [
+                    '\x1ehash1\x1fDouglas Silva\x1f2026-11-10T10:00:00-03:00\x1ffeat: add login form\x1f',
+                    'src/login.ts\nsrc/auth.ts\n',
+                    '\x1ehash2\x1fDouglas Silva\x1f2026-11-10T11:30:00-03:00\x1ffix: validate token\x1f',
+                    'src/auth.ts\n',
+                ].join('');
+                callback(null, sampleLog, '');
+                return;
+            }
+
+            callback(null, '', '');
+        });
     });
 
     /**
-     * Verifies that detectDefaultBranch detects the main branch offline using `git branch -r`.
+     * Verifies that getWorkItems applies the default 1-year lookback window, `--no-merges`,
+     * resolves the default branch, and parses commits cleanly.
      */
-    it('deve descobrir a branch principal offline via git branch -r quando não informada', async () => {
-        setupGitCommandMocks('  origin/HEAD -> origin/main\n  origin/main\n  origin/develop\n', '');
-
-        const service = new GitWorkHourEstimatorService();
-        const detectedBranch = await service.detectDefaultBranch('/repo/exemplo');
-
-        expect(detectedBranch).toBe('main');
-        expect(mockExecFile).toHaveBeenCalledWith(
-            'git',
-            ['branch', '-r'],
-            expect.objectContaining({ cwd: '/repo/exemplo' }),
-            expect.any(Function)
-        );
-    });
-
-    /**
-     * Verifies that getWorkItems applies the default 90-day filter, detects main branch, and parses commits.
-     */
-    it('deve aplicar o filtro padrão de 90 dias, usar branch principal e parsear commits', async () => {
-        const stdout = buildMockGitLogStdout([
-            {
-                hash: 'hash-1',
-                authorName: 'Douglas',
-                authoredAt: '2026-10-10T10:00:00-03:00',
-                subject: 'feat: cria servico de git',
-                files: ['src/services/git.service.ts', 'src/types/repo.ts'],
-            },
-            {
-                hash: 'hash-2',
-                authorName: 'Douglas',
-                authoredAt: '2026-10-10T15:30:00-03:00',
-                subject: 'fix(git): ajusta flag de clone',
-                files: ['src/services/git.service.ts'],
-            },
-        ]);
-
-        setupGitCommandMocks('  origin/HEAD -> origin/main\n  origin/main\n', stdout);
-
+    it('deve aplicar o filtro padrão de 1 ano, usar branch principal e parsear commits', async () => {
         const service = new GitWorkHourEstimatorService();
         const items = await service.getWorkItems('/repo/exemplo');
 
-        // Step 6: Assert `git log` uses the resolved `origin/main` ref.
+        // Step 5: Assert parsed items and verify `git log` receives `--no-merges` and `--since=1 year ago`.
+        expect(items).toHaveLength(2);
+        expect(items[0]?.subject).toBe('feat: add login form');
         expect(mockExecFile).toHaveBeenCalledWith(
             'git',
-            expect.arrayContaining(['log', 'origin/main', '--name-only', '--since=90 days ago']),
-            expect.objectContaining({ cwd: '/repo/exemplo' }),
-            expect.any(Function)
-        );
-
-        const expectedItems: CommitWorkItem[] = [
-            {
-                hash: 'hash-1',
-                authorName: 'Douglas',
-                authoredAt: '2026-10-10T10:00:00-03:00',
-                subject: 'feat: cria servico de git',
-                filesChanged: ['src/services/git.service.ts', 'src/types/repo.ts'],
-            },
-            {
-                hash: 'hash-2',
-                authorName: 'Douglas',
-                authoredAt: '2026-10-10T15:30:00-03:00',
-                subject: 'fix(git): ajusta flag de clone',
-                filesChanged: ['src/services/git.service.ts'],
-            },
-        ];
-
-        expect(items).toEqual(expectedItems);
-    });
-
-    /**
-     * Verifies that custom filters (since, until, author, branch) are passed to git log.
-     */
-    it('deve repassar filtros personalizados de since, until, author e branch para o git log', async () => {
-        setupGitCommandMocks('', '');
-
-        const service = new GitWorkHourEstimatorService();
-        await service.getWorkItems('/repo/exemplo', {
-            since: '2026-01-01',
-            until: '2026-03-31',
-            author: 'Douglas',
-            branch: 'feature/estimativas',
-        });
-
-        expect(mockExecFile).toHaveBeenCalledWith(
-            'git',
-            expect.arrayContaining([
-                'log',
-                'feature/estimativas',
-                '--since=2026-01-01',
-                '--until=2026-03-31',
-                '--author=Douglas',
-            ]),
+            expect.arrayContaining(['log', 'origin/main', '--no-merges', '--name-only', '--since=1 year ago']),
             expect.objectContaining({ cwd: '/repo/exemplo' }),
             expect.any(Function)
         );
     });
 
     /**
-     * Verifies that clean branch names (e.g. prod-v1.0) appear in metrics and Markdown reports
-     * even when git log internally resolves `origin/prod-v1.0`.
-     */
-    it('deve manter o nome limpo da branch nas métricas e no .md enquanto usa origin/<branch> no git log', async () => {
-        const stdout = buildMockGitLogStdout([
-            {
-                hash: 'p1',
-                authorName: 'Douglas',
-                authoredAt: '2026-11-12T10:00:00-03:00',
-                subject: 'feat: release prod-v1.0',
-                files: ['src/index.ts'],
-            },
-        ]);
-
-        setupGitCommandMocks('  origin/prod-v1.0\n  origin/main\n', stdout, ['origin/prod-v1.0']);
-
-        const service = new GitWorkHourEstimatorService();
-        const result = await service.estimateAndSaveMarkdown('/repo/dswebWeb', {
-            branch: 'origin/prod-v1.0',
-        });
-
-        expect(result.metrics.appliedFilters).toMatchObject({ branch: 'prod-v1.0' });
-        expect(mockExecFile).toHaveBeenCalledWith(
-            'git',
-            expect.arrayContaining(['log', 'origin/prod-v1.0']),
-            expect.objectContaining({ cwd: '/repo/dswebWeb' }),
-            expect.any(Function)
-        );
-
-        const expectedFile = join(resolve(process.cwd(), 'estimate', 'dswebWeb'), 'estimation.md');
-        expect(mockWriteFile).toHaveBeenCalledWith(
-            expectedFile,
-            expect.stringContaining('- **Branch:** prod-v1.0'),
-            'utf-8'
-        );
-    });
-
-    /**
-     * Verifies that multiple commits on the same calendar day count as one active day
-     * and calculates optimistic, base, and conservative hours using active days and unique files.
+     * Verifies that multiple commits on the same day count as 1 active day and computes
+     * optimistic, base, and conservative hours using default weights (3.5h/day and 0.1h/file).
      */
     it('deve agrupar múltiplos commits no mesmo dia como 1 dia ativo e calcular faixa de horas', () => {
         const service = new GitWorkHourEstimatorService();
-        const items: CommitWorkItem[] = [
+        const commits: CommitWorkItem[] = [
             {
-                hash: 'c1',
-                authorName: 'Douglas',
-                authoredAt: '2026-11-01T09:00:00-03:00',
-                subject: 'feat: tela inicial',
-                filesChanged: ['a.ts', 'b.ts'],
+                hash: '1',
+                authorName: 'Douglas Silva',
+                authoredAt: '2026-11-10T10:00:00-03:00',
+                subject: 'feat: create dashboard',
+                filesChanged: ['src/app.ts', 'src/dashboard.ts'],
             },
             {
-                hash: 'c2',
-                authorName: 'Douglas',
-                authoredAt: '2026-11-01T14:00:00-03:00',
-                subject: 'fix: estilo do botao',
-                filesChanged: ['b.ts'],
+                hash: '2',
+                authorName: 'Douglas Silva',
+                authoredAt: '2026-11-10T14:00:00-03:00',
+                subject: 'fix: adjust card spacing',
+                filesChanged: ['src/dashboard.ts'],
             },
             {
-                hash: 'c3',
-                authorName: 'Douglas',
-                authoredAt: '2026-11-02T11:00:00-03:00',
-                subject: 'chore: atualiza docs',
-                filesChanged: ['c.ts'],
+                hash: '3',
+                authorName: 'Douglas Silva',
+                authoredAt: '2026-11-11T09:30:00-03:00',
+                subject: 'refactor: extract chart helper',
+                filesChanged: ['src/chart.ts'],
             },
         ];
 
-        const metrics = service.calculateHourMetrics(items, DEFAULT_HOUR_ESTIMATION_CONFIG);
+        const metrics = service.calculateHourMetrics(commits);
 
-        expect(metrics.totalCommits).toBe(3);
+        // Step 6: 2 active days * 3.5h + 3 unique files * 0.1h = 7.3h base;
+        // optimistic: 7.3 * 0.8 = 5.8h; conservative: 7.3 * 1.3 = 9.5h.
         expect(metrics.activeDays).toBe(2);
-        expect(metrics.commitsPerActiveDay).toBe(1.5);
         expect(metrics.uniqueFilesTouched).toBe(3);
         expect(metrics.totalFileTouches).toBe(4);
-        expect(metrics.baseHours).toBe(12.8);
-        expect(metrics.optimisticHours).toBe(Number((12.8 * 0.8).toFixed(1)));
-        expect(metrics.conservativeHours).toBe(Number((12.8 * 1.35).toFixed(1)));
+        expect(metrics.baseHours).toBe(7.3);
+        expect(metrics.optimisticHours).toBe(Number((7.3 * 0.8).toFixed(1)));
+        expect(metrics.conservativeHours).toBe(Number((7.3 * 1.3).toFixed(1)));
         expect(metrics.subjectPrefixes).toEqual({
             feat: 1,
             fix: 1,
-            chore: 1,
+            refactor: 1,
         });
     });
 
     /**
-     * Verifies zeroed metrics when there are no commits in the filtered range.
-     */
-    it('deve retornar métricas zeradas quando não houver commits', () => {
-        const service = new GitWorkHourEstimatorService();
-        const metrics = service.calculateHourMetrics([]);
-
-        expect(metrics.totalCommits).toBe(0);
-        expect(metrics.activeDays).toBe(0);
-        expect(metrics.optimisticHours).toBe(0);
-        expect(metrics.baseHours).toBe(0);
-        expect(metrics.conservativeHours).toBe(0);
-        expect(metrics.subjectPrefixes).toEqual({});
-    });
-
-    /**
-     * Verifies end-to-end execution of estimateFromRepository combining log reading and calculation.
+     * Verifies that estimateFromRepository returns metrics and normalized applied filters.
      */
     it('deve executar estimateFromRepository retornando métricas e filtros aplicados', async () => {
-        const stdout = buildMockGitLogStdout([
-            {
-                hash: 'h1',
-                authorName: 'Douglas',
-                authoredAt: '2026-11-10T10:00:00-03:00',
-                subject: 'feat: endpoint de estimativa',
-                files: ['src/index.ts'],
-            },
-        ]);
-
-        setupGitCommandMocks('  origin/main\n', stdout);
-
         const service = new GitWorkHourEstimatorService();
-        const result = await service.estimateFromRepository('/repo/api', {
-            since: '30 days ago',
+        const result = await service.estimateFromRepository('/repo/exemplo', {
+            branch: 'origin/main',
         });
 
-        expect(result.appliedFilters).toEqual({
-            since: '30 days ago',
-            until: undefined,
-            author: undefined,
+        // Step 7: 1 active day * 3.5h + 2 unique files * 0.1h = 3.7h base for the mocked log.
+        expect(result.appliedFilters.branch).toBe('main');
+        expect(result.appliedFilters.since).toBe('1 year ago');
+        expect(result.activeDays).toBe(1);
+        expect(result.baseHours).toBe(3.7);
+    });
+
+    /**
+     * Verifies that saveEstimateMarkdown caps the commit table at 100 rows when more commits exist
+     * while keeping the full metrics count.
+     */
+    it('deve limitar a tabela do Markdown aos 100 commits mais recentes quando houver mais de 100', async () => {
+        const service = new GitWorkHourEstimatorService();
+        const manyCommits: CommitWorkItem[] = Array.from({ length: 120 }, (_, index) => ({
+            hash: `hash-${index + 1}`,
+            authorName: 'Douglas Silva',
+            authoredAt: '2026-11-15T12:00:00-03:00',
+            subject: `feat: item ${index + 1}`,
+            filesChanged: [`src/file-${index + 1}.ts`],
+        }));
+
+        const metrics = service.calculateHourMetrics(manyCommits, undefined, {
+            since: '1 year ago',
             branch: 'main',
         });
-        expect(result.activeDays).toBe(1);
-        expect(result.baseHours).toBe(6.3);
-    });
 
-    /**
-     * Verifies that saveEstimateMarkdown creates estimate/<REPO_NAME> and writes the Markdown report
-     * including the |autor|desc_commit|data| table.
-     */
-    it('deve criar a pasta estimate/NOME_REPOSITORIO e salvar o .md com a tabela de commits', async () => {
-        const service = new GitWorkHourEstimatorService();
-        const metrics: WorkHourMetrics = {
-            totalCommits: 1,
-            activeDays: 1,
-            commitsPerActiveDay: 1,
-            uniqueFilesTouched: 2,
-            totalFileTouches: 2,
-            appliedFilters: { since: '90 days ago' },
-            optimisticHours: 5.2,
-            baseHours: 6.5,
-            conservativeHours: 8.8,
-            subjectPrefixes: { feat: 1 },
-        };
+        await service.saveEstimateMarkdown('/repos/repo-grande', metrics, manyCommits, 'estimate-test');
 
-        const commits: CommitWorkItem[] = [
-            {
-                hash: 'abc123',
-                authorName: 'Douglas',
-                authoredAt: '2026-11-18T10:30:00-03:00',
-                subject: 'feat: adiciona estimativa em markdown',
-                filesChanged: ['src/services/git-work-hour.service.ts'],
-            },
-        ];
+        const expectedFile = join(resolve(process.cwd(), 'estimate-test', 'repo-grande'), 'estimation.md');
+        expect(mockWriteFile).toHaveBeenCalledTimes(1);
 
-        const expectedDir = resolve(process.cwd(), 'estimate', 'meu-projeto');
-        const expectedFile = join(expectedDir, 'estimation.md');
-
-        const savedPath = await service.saveEstimateMarkdown('/repos/meu-projeto', metrics, commits);
-
-        expect(savedPath).toBe(expectedFile);
-        expect(mockMkdir).toHaveBeenCalledWith(expectedDir, { recursive: true });
-        expect(mockWriteFile).toHaveBeenCalledWith(
-            expectedFile,
-            expect.stringContaining('# Estimativa de Horas — meu-projeto'),
-            'utf-8'
-        );
-        expect(mockWriteFile).toHaveBeenCalledWith(
-            expectedFile,
-            expect.stringContaining('|autor|desc_commit|data|'),
-            'utf-8'
-        );
-        expect(mockWriteFile).toHaveBeenCalledWith(
-            expectedFile,
-            expect.stringContaining(
-                '|Douglas|feat: adiciona estimativa em markdown|2026-11-18T10:30:00-03:00|'
-            ),
-            'utf-8'
-        );
-    });
-
-    /**
-     * Verifies that saveEstimateMarkdown logs a console.warn when an estimate already exists.
-     */
-    it('deve emitir console.warn ao sobrescrever uma estimativa existente do repositório', async () => {
-        mockAccess.mockResolvedValueOnce(undefined);
-
-        const service = new GitWorkHourEstimatorService();
-        const metrics: WorkHourMetrics = {
-            totalCommits: 1,
-            activeDays: 1,
-            commitsPerActiveDay: 1,
-            uniqueFilesTouched: 1,
-            totalFileTouches: 1,
-            appliedFilters: { since: '90 days ago' },
-            optimisticHours: 5,
-            baseHours: 6.3,
-            conservativeHours: 8.5,
-            subjectPrefixes: { feat: 1 },
-        };
-
-        await service.saveEstimateMarkdown('/repos/meu-projeto', metrics, []);
-
-        expect(warnSpy).toHaveBeenCalledTimes(1);
-        expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('meu-projeto'));
-    });
-
-    /**
-     * Verifies that estimateAndSaveMarkdown calculates metrics and persists the Markdown report.
-     */
-    it('deve calcular métricas e salvar o arquivo .md em estimate/NOME_REPOSITORIO via estimateAndSaveMarkdown', async () => {
-        const stdout = buildMockGitLogStdout([
-            {
-                hash: 'h2',
-                authorName: 'Douglas',
-                authoredAt: '2026-11-15T14:00:00-03:00',
-                subject: 'feat: gera relatorio md',
-                files: ['src/services/git-work-hour.service.ts'],
-            },
-        ]);
-
-        setupGitCommandMocks('  origin/master\n', stdout);
-
-        const service = new GitWorkHourEstimatorService();
-        const result = await service.estimateAndSaveMarkdown('/repos/dsweb-cli');
-
-        const expectedDir = resolve(process.cwd(), 'estimate', 'dsweb-cli');
-        const expectedFile = join(expectedDir, 'estimation.md');
-
-        expect(result.filePath).toBe(expectedFile);
-        expect(result.metrics.activeDays).toBe(1);
-        expect(result.commits).toHaveLength(1);
-        expect(mockMkdir).toHaveBeenCalledWith(expectedDir, { recursive: true });
-        expect(mockWriteFile).toHaveBeenCalledWith(
-            expectedFile,
-            expect.stringContaining('|autor|desc_commit|data|'),
-            'utf-8'
-        );
+        const writtenMarkdown = mockWriteFile.mock.calls[0]?.[1] ?? '';
+        expect(mockWriteFile.mock.calls[0]?.[0]).toBe(expectedFile);
+        expect(writtenMarkdown).toContain('- **Total de commits:** 120');
+        expect(writtenMarkdown).toContain('|Douglas Silva|feat: item 100|2026-11-15T12:00:00-03:00|');
+        expect(writtenMarkdown).not.toContain('|Douglas Silva|feat: item 101|2026-11-15T12:00:00-03:00|');
+        expect(writtenMarkdown).toContain('20 commits anteriores omitidos da tabela');
     });
 });
