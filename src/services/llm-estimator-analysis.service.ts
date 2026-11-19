@@ -1,6 +1,7 @@
 import { env } from '@/env';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { ChatOpenAI } from '@langchain/openai';
+import { MarkdownTextSplitter, RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 
@@ -13,6 +14,7 @@ export type GenerateLlmAnalysisParams = {
     userGoalAndDetails: string;
     maxCharsPerFile?: number;
     maxTotalChars?: number;
+    chunkOverlap?: number;
 };
 
 /**
@@ -23,6 +25,7 @@ export class LlmEstimatorAnalysisService {
     private readonly analysisFileName = 'analysis.md';
     private readonly defaultMaxCharsPerFile = 4000;
     private readonly defaultMaxTotalChars = 20000;
+    private readonly defaultChunkOverlap = 150;
 
     /**
      * Creates a LangChain chat model instance (OpenAI by default).
@@ -68,29 +71,125 @@ export class LlmEstimatorAnalysisService {
     }
 
     /**
+     * Splits Markdown content using LangChain's MarkdownTextSplitter so headings,
+     * sections, and blocks are split at natural boundaries.
+     */
+    private async splitMarkdownIntoChunks(
+        markdownText: string,
+        chunkSize: number,
+        chunkOverlap: number
+    ): Promise<string[]> {
+        // Step 4: Return empty array when content has no non-whitespace characters.
+        const trimmed = markdownText.trim();
+        if (!trimmed) {
+            return [];
+        }
+
+        // Step 5: Split Markdown text using MarkdownTextSplitter.
+        const splitter = new MarkdownTextSplitter({
+            chunkSize: Math.max(200, chunkSize),
+            chunkOverlap: Math.min(chunkOverlap, Math.floor(Math.max(200, chunkSize) / 4)),
+        });
+
+        return splitter.splitText(trimmed);
+    }
+
+    /**
+     * Splits general text using LangChain's RecursiveCharacterTextSplitter.
+     */
+    private async splitGeneralTextIntoChunks(
+        text: string,
+        chunkSize: number,
+        chunkOverlap: number
+    ): Promise<string[]> {
+        // Step 6: Return empty array when text has no non-whitespace characters.
+        const trimmed = text.trim();
+        if (!trimmed) {
+            return [];
+        }
+
+        // Step 7: Split text using RecursiveCharacterTextSplitter.
+        const splitter = new RecursiveCharacterTextSplitter({
+            chunkSize: Math.max(200, chunkSize),
+            chunkOverlap: Math.min(chunkOverlap, Math.floor(Math.max(200, chunkSize) / 4)),
+        });
+
+        return splitter.splitText(trimmed);
+    }
+
+    /**
+     * Joins multiple chunks sequentially up to `maxBudgetChars` so the prompt includes
+     * as many complete chunks as fit without exceeding the budget.
+     */
+    private joinChunksUpToBudget(
+        chunks: string[],
+        maxBudgetChars: number
+    ): { text: string; truncated: boolean } {
+        // Step 8: Accumulate chunks until adding the next chunk would exceed maxBudgetChars.
+        if (chunks.length === 0 || maxBudgetChars <= 0) {
+            return { text: '', truncated: chunks.length > 0 };
+        }
+
+        const includedChunks: string[] = [];
+        let usedChars = 0;
+        let truncated = false;
+
+        for (const chunk of chunks) {
+            const cleanChunk = chunk.trim();
+            if (!cleanChunk) {
+                continue;
+            }
+
+            const separatorLength = includedChunks.length > 0 ? 2 : 0; // "\n\n"
+            if (usedChars + separatorLength + cleanChunk.length <= maxBudgetChars) {
+                includedChunks.push(cleanChunk);
+                usedChars += separatorLength + cleanChunk.length;
+            } else {
+                truncated = true;
+                break;
+            }
+        }
+
+        return {
+            text: includedChunks.join('\n\n'),
+            truncated,
+        };
+    }
+
+    /**
      * Builds the prompt payload with the estimation report, repository Markdown files,
-     * and the user's goal/project details while respecting character limits.
+     * and the user's goal/project details by joining splitter chunks up to the total limit.
      */
     private async buildPromptContent(params: GenerateLlmAnalysisParams): Promise<string> {
         const maxCharsPerFile = params.maxCharsPerFile ?? this.defaultMaxCharsPerFile;
         const maxTotalChars = params.maxTotalChars ?? this.defaultMaxTotalChars;
+        const chunkOverlap = params.chunkOverlap ?? this.defaultChunkOverlap;
 
-        // Step 4: Read the previously generated estimation.md report.
+        // Step 9: Read and chunk estimation.md using RecursiveCharacterTextSplitter.
         const estimationContent = await readFile(params.estimateMarkdownPath, 'utf-8');
+        const estimationChunks = await this.splitGeneralTextIntoChunks(
+            estimationContent,
+            maxCharsPerFile,
+            chunkOverlap
+        );
+        const joinedEstimation = this.joinChunksUpToBudget(
+            estimationChunks,
+            Math.max(1000, Math.floor(maxTotalChars * 0.4))
+        ).text;
 
         const parts: string[] = [
             '# Objetivo e Detalhes Informados pelo Usuário',
             params.userGoalAndDetails.trim(),
             '',
             '# Relatório de Estimativa de Horas (estimation.md)',
-            estimationContent.trim(),
+            joinedEstimation,
             '',
             '# Arquivos Markdown do Repositório',
         ];
 
         let totalChars = parts.join('\n').length;
 
-        // Step 5: Append repository `.md` files with per-file and total size caps.
+        // Step 10: Collect repository `.md` files and join chunks up to maxTotalChars.
         const mdFiles = await this.collectRepoMarkdownFiles(params.repoDir);
 
         for (const filePath of mdFiles) {
@@ -103,18 +202,28 @@ export class LlmEstimatorAnalysisService {
 
             const rawText = await readFile(filePath, 'utf-8');
             const relPath = relative(params.repoDir, filePath);
-            const remaining = maxTotalChars - totalChars;
-            const limitForFile = Math.min(maxCharsPerFile, remaining);
 
-            const safeText =
-                rawText.length > limitForFile
-                    ? `${rawText.slice(0, limitForFile)}\n\n[...conteúdo truncado...]`
-                    : rawText;
+            const fileChunks = await this.splitMarkdownIntoChunks(rawText, 1200, chunkOverlap);
+            const remainingBudget = maxTotalChars - totalChars;
+            const fileBudget = Math.min(maxCharsPerFile, remainingBudget);
+
+            const { text: joinedFileText, truncated } = this.joinChunksUpToBudget(
+                fileChunks,
+                fileBudget
+            );
+
+            if (!joinedFileText) {
+                continue;
+            }
+
+            const contentWithNotice = truncated
+                ? `${joinedFileText}\n\n[...trechos adicionais omitidos para respeitar o limite...]`
+                : joinedFileText;
 
             const section = [
                 `## Arquivo: ${relPath}`,
                 '```markdown',
-                safeText.trim(),
+                contentWithNotice,
                 '```',
                 '',
             ].join('\n');
@@ -130,7 +239,7 @@ export class LlmEstimatorAnalysisService {
      * Runs the LLM analysis and writes the resulting Markdown report to `estimate/<REPO>/analysis.md`.
      */
     public async generateAndSaveAnalysis(params: GenerateLlmAnalysisParams): Promise<string> {
-        // Step 6: Build prompt and send system + human messages via LangChain.
+        // Step 11: Build prompt and send system + human messages via LangChain.
         const model = this.createChatModel();
         const promptContent = await this.buildPromptContent(params);
 
@@ -151,7 +260,7 @@ export class LlmEstimatorAnalysisService {
                 ? response.content
                 : JSON.stringify(response.content, null, 2);
 
-        // Step 7: Save output inside the same estimate/<REPO> folder as `analysis.md`.
+        // Step 12: Save output inside the same estimate/<REPO> folder as `analysis.md`.
         const estimateDir = dirname(resolve(params.estimateMarkdownPath));
         const repoName = basename(estimateDir);
         const analysisFilePath = join(estimateDir, this.analysisFileName);

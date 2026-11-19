@@ -10,8 +10,22 @@ type FakeDirent = {
     isFile: () => boolean;
 };
 
+/**
+ * Options accepted by LangChain text splitters in tests.
+ */
+type SplitterOptions = {
+    chunkSize?: number;
+    chunkOverlap?: number;
+};
+
 const mockInvoke = jest.fn<(messages: unknown[]) => Promise<{ content: unknown }>>();
 const mockChatOpenAI = jest.fn<(options: Record<string, unknown>) => { invoke: typeof mockInvoke }>();
+const mockMarkdownSplitter = jest.fn<
+    (options?: SplitterOptions) => { splitText: (text: string) => Promise<string[]> }
+>();
+const mockRecursiveSplitter = jest.fn<
+    (options?: SplitterOptions) => { splitText: (text: string) => Promise<string[]> }
+>();
 const mockMkdir = jest.fn<(path: string, options?: { recursive?: boolean }) => Promise<string | undefined>>();
 const mockReaddir = jest.fn<(path: string, options?: { withFileTypes?: boolean }) => Promise<FakeDirent[]>>();
 const mockReadFile = jest.fn<(filePath: string, encoding?: BufferEncoding) => Promise<string>>();
@@ -39,7 +53,13 @@ jest.unstable_mockModule('@langchain/openai', () => ({
     ChatOpenAI: mockChatOpenAI,
 }));
 
-// Step 3: Mock node:fs/promises to simulate repository files and output directory writes.
+// Step 3: Mock @langchain/textsplitters to split text into deterministic chunks in tests.
+jest.unstable_mockModule('@langchain/textsplitters', () => ({
+    MarkdownTextSplitter: mockMarkdownSplitter,
+    RecursiveCharacterTextSplitter: mockRecursiveSplitter,
+}));
+
+// Step 4: Mock node:fs/promises to simulate repository files and output directory writes.
 jest.unstable_mockModule('node:fs/promises', () => ({
     mkdir: mockMkdir,
     readdir: mockReaddir,
@@ -47,7 +67,7 @@ jest.unstable_mockModule('node:fs/promises', () => ({
     writeFile: mockWriteFile,
 }));
 
-// Step 4: Dynamically import the service after mocks are registered.
+// Step 5: Dynamically import the service after mocks are registered.
 const { LlmEstimatorAnalysisService } = await import('@/services/llm-estimator-analysis.service');
 
 /**
@@ -61,9 +81,25 @@ function makeDirent(name: string, kind: 'file' | 'directory'): FakeDirent {
     };
 }
 
+/**
+ * Splits a string into fixed-size slices for deterministic splitter mock behavior.
+ */
+function createSliceSplitter(options?: SplitterOptions) {
+    const size = Math.max(20, options?.chunkSize ?? 1200);
+    return {
+        splitText: async (text: string): Promise<string[]> => {
+            const chunks: string[] = [];
+            for (let i = 0; i < text.length; i += size) {
+                chunks.push(text.slice(i, i + size));
+            }
+            return chunks.length > 0 ? chunks : [text];
+        },
+    };
+}
+
 describe('LlmEstimatorAnalysisService', () => {
     beforeEach(() => {
-        // Step 5: Reset all mocks and restore default fake environment before each test.
+        // Step 6: Reset all mocks and restore default fake environment and splitters before each test.
         jest.clearAllMocks();
         fakeEnv.OPENAI_API_KEY = 'sk-test-fake-key';
         fakeEnv.OPENAI_MODEL = 'gpt-4o-mini';
@@ -72,6 +108,8 @@ describe('LlmEstimatorAnalysisService', () => {
         mockReaddir.mockResolvedValue([]);
         mockReadFile.mockResolvedValue('');
         mockWriteFile.mockResolvedValue(undefined);
+        mockMarkdownSplitter.mockImplementation((opts) => createSliceSplitter(opts));
+        mockRecursiveSplitter.mockImplementation((opts) => createSliceSplitter(opts));
         mockInvoke.mockResolvedValue({
             content: '### Resumo da Análise\nEstimativa coerente com o escopo descrito.',
         });
@@ -146,8 +184,10 @@ describe('LlmEstimatorAnalysisService', () => {
             userGoalAndDetails: 'Quero criar um novo projeto parecido e estimar prazo e valor.',
         });
 
-        // Step 6: Verify output file path, single mocked LLM call, and written Markdown sections.
+        // Step 7: Verify output file path, splitter usage, single mocked LLM call, and saved Markdown.
         expect(savedPath).toBe(expectedAnalysisPath);
+        expect(mockRecursiveSplitter).toHaveBeenCalledTimes(1);
+        expect(mockMarkdownSplitter).toHaveBeenCalledTimes(2);
         expect(mockChatOpenAI).toHaveBeenCalledTimes(1);
         expect(mockInvoke).toHaveBeenCalledTimes(1);
         expect(mockMkdir).toHaveBeenCalledWith(resolve('/workspace/estimate/dswebWeb'), {
@@ -171,20 +211,27 @@ describe('LlmEstimatorAnalysisService', () => {
     });
 
     /**
-     * Verifies that large Markdown files are truncated according to maxCharsPerFile
-     * so the prompt stays lightweight and avoids token bloat.
+     * Verifies that chunks are joined up to maxCharsPerFile and remaining chunks are omitted cleanly.
      */
-    it('deve truncar arquivos .md grandes respeitando maxCharsPerFile', async () => {
+    it('deve juntar trechos até maxCharsPerFile e sinalizar quando houver trechos omitidos', async () => {
         const repoDir = '/repos/doc-pesada';
         const estimatePath = resolve('/workspace/estimate/doc-pesada/estimation.md');
-        const longReadme = 'A'.repeat(200);
+
+        // Step 8: Use distinct markers so we confirm multiple chunks are joined and excess is omitted.
+        const chunkA = 'A'.repeat(200);
+        const chunkB = 'B'.repeat(200);
+        const chunkC = 'C'.repeat(200);
+
+        mockMarkdownSplitter.mockImplementation(() => ({
+            splitText: async () => [chunkA, chunkB, chunkC],
+        }));
 
         mockReadFile.mockImplementation(async (targetPath: string) => {
             if (targetPath === estimatePath) {
                 return 'Resumo da estimativa';
             }
             if (targetPath === join(repoDir, 'README.md')) {
-                return longReadme;
+                return `${chunkA}${chunkB}${chunkC}`;
             }
             return '';
         });
@@ -201,7 +248,7 @@ describe('LlmEstimatorAnalysisService', () => {
             const msgList = messages as Array<{ content?: unknown }>;
             const humanMsg = msgList[1];
             capturedPromptText = typeof humanMsg?.content === 'string' ? humanMsg.content : '';
-            return { content: 'Análise com arquivo truncado.' };
+            return { content: 'Análise com trechos agrupados.' };
         });
 
         const service = new LlmEstimatorAnalysisService();
@@ -209,11 +256,15 @@ describe('LlmEstimatorAnalysisService', () => {
             repoDir,
             estimateMarkdownPath: estimatePath,
             userGoalAndDetails: 'Avaliar esforço de documentação',
-            maxCharsPerFile: 50,
+            maxCharsPerFile: 450,
             maxTotalChars: 5000,
         });
 
-        expect(capturedPromptText).toContain('[...conteúdo truncado...]');
-        expect(capturedPromptText).not.toContain('A'.repeat(200));
+        expect(capturedPromptText).toContain(chunkA);
+        expect(capturedPromptText).toContain(chunkB);
+        expect(capturedPromptText).not.toContain(chunkC);
+        expect(capturedPromptText).toContain(
+            '[...trechos adicionais omitidos para respeitar o limite...]'
+        );
     });
 });

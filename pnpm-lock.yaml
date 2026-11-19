@@ -187,6 +187,9 @@ importers:
       '@langchain/openai':
         specifier: ^1.8.4
         version: 1.8.4(@langchain/core@1.4.1(openai@7.59.0(zod@4.6.7)))
+      '@langchain/textsplitters':
+        specifier: ^1.0.2
+        version: 1.0.2(@langchain/core@1.4.1(openai@7.59.0(zod@4.6.7)))
       octokit:
         specifier: ^5.0.5
         version: 5.0.5
@@ -877,6 +880,12 @@ packages:
     engines: {node: '>=22'}
     peerDependencies:
       '@langchain/core': ^1.4.0
+
+  '@langchain/textsplitters@1.0.2':
+    resolution: {integrity: sha512-UNCmlyFIRlRfVxqpmcRsp1jQrscnIVVqRKrrjFF2wHHq+VGTv+VDkGZLyEVUopJfHIdaiXfOKlSrROQui7VLFA==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@langchain/core': ^1.0.0
 
   '@octokit/app@16.1.4':
     resolution: {integrity: sha512-g70WONQyGoBgqIJtv4O0MUEfOF1iJpTfFt3qAW7HaiwiJ6k607xg/gBezCa4tuq6BpO6qXn7qvq8v9tjWtgGQg==}
@@ -3389,6 +3398,11 @@ snapshots:
       - google-auth-library
       - undici
       - ws
+
+  '@langchain/textsplitters@1.0.2(@langchain/core@1.4.1(openai@7.59.0(zod@4.6.7)))':
+    dependencies:
+      '@langchain/core': 1.4.1(openai@7.59.0(zod@4.6.7))
+      js-tiktoken: 1.0.21
 
   '@octokit/app@16.1.4':
     dependencies:
