@@ -3,8 +3,9 @@ import { env } from '@/env';
 import { GitWorkHourEstimatorService } from '@/services/git-work-hour.service';
 import { GitService } from '@/services/git.service';
 import { GitHubService } from '@/services/github.service';
+import { LlmEstimatorAnalysisService } from '@/services/llm-estimator-analysis.service';
 import { ExitPromptError } from '@inquirer/core';
-import { confirm, select } from '@inquirer/prompts';
+import { confirm, input, select } from '@inquirer/prompts';
 import { basename, resolve } from 'node:path';
 
 /**
@@ -56,13 +57,14 @@ async function promptBranchForRepository(
 
 /**
  * Main CLI orchestration function that lists GitHub repositories, lists branches and
- * prompts per repository, clones/updates them, and optionally generates estimates.
+ * prompts per repository, clones/updates them, generates estimates, and optionally runs LLM analysis.
  */
 async function main() {
-    // Step 3: Instantiate GitHub, Git, and work-hour estimator services.
+    // Step 3: Instantiate GitHub, Git, work-hour estimator, and LLM analysis services.
     const githubService = new GitHubService();
     const gitService = new GitService();
     const estimatorService = new GitWorkHourEstimatorService();
+    const llmAnalysisService = new LlmEstimatorAnalysisService();
 
     // Step 4: Fetch repositories from GitHub and stop early if none are found.
     console.log('Buscando repositórios no GitHub...');
@@ -134,7 +136,23 @@ async function main() {
         ],
     });
 
-    // Step 10: Run estimation for each repository using the branch chosen for that repository.
+    // Step 10: Always ask whether the LLM should perform an analysis; if yes, ask goal and details.
+    const shouldRunLlmAnalysis = await confirm({
+        message: 'Deseja que o LLM faça uma análise sobre essas estimativas? (Y/N)',
+        default: false,
+    });
+
+    let userGoalAndDetails = '';
+    if (shouldRunLlmAnalysis) {
+        userGoalAndDetails = await input({
+            message:
+                'Qual o objetivo da análise? (Ex.: você quer criar um novo projeto e estimar quanto cobrar ou quanto tempo levaria para executar esse projeto? Se sim, me fale sobre o projeto e dê o maior número de detalhes):',
+            validate: (value) =>
+                value.trim().length > 0 || 'Por favor, informe o objetivo e os detalhes do projeto.',
+        });
+    }
+
+    // Step 11: Run estimation for each repository and save `analysis.md` when requested.
     const baseCloneDir = resolve(env.CLONE_DEST_DIR);
 
     for (const repo of processedRepos) {
@@ -145,13 +163,34 @@ async function main() {
             if (outputMode === 'markdown') {
                 const { filePath } = await estimatorService.estimateAndSaveMarkdown(repoDir, filters);
                 console.log(`Arquivo .md gerado para ${repo.repoName} (branch: ${repo.branch}): ${filePath}`);
+
+                if (shouldRunLlmAnalysis) {
+                    console.log(`Gerando análise com LLM para ${repo.repoName}...`);
+                    const analysisPath = await llmAnalysisService.generateAndSaveAnalysis({
+                        repoDir,
+                        estimateMarkdownPath: filePath,
+                        userGoalAndDetails,
+                    });
+                    console.log(`Análise LLM salva em: ${analysisPath}`);
+                }
             } else {
                 const metrics = await estimatorService.estimateFromRepository(repoDir, filters);
                 console.log(`\nEstimativas para ${repo.repoName} (branch: ${repo.branch}):`);
                 console.dir(metrics, { depth: null });
+
+                if (shouldRunLlmAnalysis) {
+                    const savedEstimatePath = await estimatorService.saveEstimateMarkdown(repoDir, metrics);
+                    console.log(`Gerando análise com LLM para ${repo.repoName}...`);
+                    const analysisPath = await llmAnalysisService.generateAndSaveAnalysis({
+                        repoDir,
+                        estimateMarkdownPath: savedEstimatePath,
+                        userGoalAndDetails,
+                    });
+                    console.log(`Análise LLM salva em: ${analysisPath}`);
+                }
             }
         } catch (error) {
-            console.error(`Erro ao estimar ${repo.repoName}:`, error);
+            console.error(`Erro ao processar ${repo.repoName}:`, error);
         }
     }
 }
