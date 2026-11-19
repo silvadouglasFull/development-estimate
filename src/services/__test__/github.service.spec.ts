@@ -1,18 +1,22 @@
 import { beforeEach, describe, expect, it, jest } from '@jest/globals';
 
-const mockPaginate = jest.fn();
+const mockPaginate = jest.fn<(...args: unknown[]) => Promise<unknown[]>>();
 const mockListRepos = jest.fn();
 
-// Mocka o arquivo de ambiente para não exigir um .env real nos testes
+// Step 1: Mock environment variables before importing GitHubService.
 jest.unstable_mockModule('@/env', () => ({
     env: {
+        NODE_ENV: 'test',
+        PORT: 3000,
+        API_KEY: 'fake-api-key',
         GITHUB_TOKEN: 'fake-token',
+        GITHUB_HOST: 'fake-host',
         GIT_PEM_PATH: '/fake/key.pem',
         CLONE_DEST_DIR: './fake-repos',
     },
 }));
 
-// Mocka o SDK do Octokit
+// Step 2: Mock Octokit SDK so no real HTTP requests are made to GitHub.
 jest.unstable_mockModule('octokit', () => ({
     Octokit: jest.fn().mockImplementation(() => ({
         paginate: mockPaginate,
@@ -24,7 +28,7 @@ jest.unstable_mockModule('octokit', () => ({
     })),
 }));
 
-// Importa o serviço dinamicamente após registrar os mocks
+// Step 3: Dynamically import GitHubService after mocks are registered.
 const { GitHubService } = await import('@/services/github.service');
 
 describe('GitHubService', () => {
@@ -32,19 +36,22 @@ describe('GitHubService', () => {
         jest.clearAllMocks();
     });
 
+    /**
+     * Verifies that listRepositories paginates user repositories and maps them to Repository objects.
+     */
     it('deve listar e formatar os repositórios do usuário autenticado', async () => {
         mockPaginate.mockResolvedValueOnce([
             {
                 full_name: 'usuario/repo-privado',
-                ssh_url: 'git@github.com:usuario/repo-privado.git',
+                ssh_url: 'git@fake-host:usuario/repo-privado.git',
                 private: true,
             },
             {
                 full_name: 'usuario/repo-publico',
-                ssh_url: 'git@github.com:usuario/repo-publico.git',
+                ssh_url: 'git@fake-host:usuario/repo-publico.git',
                 private: false,
             },
-        ] as never);
+        ]);
 
         const service = new GitHubService();
         const result = await service.listRepositories();
@@ -57,19 +64,22 @@ describe('GitHubService', () => {
         expect(result).toEqual([
             {
                 fullName: 'usuario/repo-privado',
-                sshUrl: 'git@github.com:usuario/repo-privado.git',
+                sshUrl: 'git@fake-host:usuario/repo-privado.git',
                 isPrivate: true,
             },
             {
                 fullName: 'usuario/repo-publico',
-                sshUrl: 'git@github.com:usuario/repo-publico.git',
+                sshUrl: 'git@fake-host:usuario/repo-publico.git',
                 isPrivate: false,
             },
         ]);
     });
 
+    /**
+     * Verifies that listRepositories returns an empty array when no repositories are returned.
+     */
     it('deve retornar uma lista vazia quando não houver repositórios', async () => {
-        mockPaginate.mockResolvedValueOnce([] as never);
+        mockPaginate.mockResolvedValueOnce([]);
 
         const service = new GitHubService();
         const result = await service.listRepositories();
