@@ -7,20 +7,22 @@ import type {
     WorkLogFilters,
 } from '@/types/work-hour-estimator.types';
 import { execFile } from 'node:child_process';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { basename, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
-
-
 /**
- * Service that reads git commit logs and estimates optimistic, base, and conservative work hours.
+ * Service that reads git commit logs, estimates work hour ranges, and exports Markdown reports.
  */
 export class GitWorkHourEstimatorService implements WorkHourEstimator {
     private readonly fieldSeparator = '\x1f';
     private readonly recordSeparator = '\x1e';
     private readonly defaultConfig: HourEstimationConfig;
     private readonly defaultFilters: WorkLogFilters;
+    private readonly estimatesRootDir = 'estimate';
+    private readonly reportFileName = 'estimation.md';
 
     constructor(
         defaultFilters: WorkLogFilters = DEFAULT_WORK_LOG_FILTERS,
@@ -173,6 +175,89 @@ export class GitWorkHourEstimatorService implements WorkHourEstimator {
         const resolvedFilters = this.resolveFilters(filters);
         const items = await this.getWorkItems(repoDir, resolvedFilters);
         return this.calculateHourMetrics(items, config, resolvedFilters);
+    }
+
+    /**
+     * Creates estimate/<REPO_NAME> and writes a Markdown report containing the hour metrics.
+     */
+    public async saveEstimateMarkdown(
+        repoDir: string,
+        metrics: WorkHourMetrics,
+        outputRootDir: string = this.estimatesRootDir
+    ): Promise<string> {
+        // Step 7: Resolve repository folder name and ensure target directory exists.
+        const repoName = this.extractRepoName(repoDir);
+        const targetDir = resolve(process.cwd(), outputRootDir, repoName);
+        const targetFile = join(targetDir, this.reportFileName);
+
+        await mkdir(targetDir, { recursive: true });
+
+        // Step 8: Build Markdown content and write it to disk.
+        const markdownContent = this.formatMarkdownReport(repoName, metrics);
+        await writeFile(targetFile, markdownContent, 'utf-8');
+
+        return targetFile;
+    }
+
+    /**
+     * Runs estimation for a repository and saves the resulting Markdown report to disk.
+     */
+    public async estimateAndSaveMarkdown(
+        repoDir: string,
+        filters?: WorkLogFilters,
+        config: HourEstimationConfig = this.defaultConfig,
+        outputRootDir: string = this.estimatesRootDir
+    ): Promise<{ metrics: WorkHourMetrics; filePath: string }> {
+        const metrics = await this.estimateFromRepository(repoDir, filters, config);
+        const filePath = await this.saveEstimateMarkdown(repoDir, metrics, outputRootDir);
+
+        return { metrics, filePath };
+    }
+
+    /**
+     * Extracts and sanitizes the repository name from a directory path.
+     */
+    private extractRepoName(repoDir: string): string {
+        const rawName = basename(resolve(repoDir));
+        const sanitized = rawName.replace(/[^a-zA-Z0-9._-]/g, '-');
+        return sanitized || 'repository';
+    }
+
+    /**
+     * Formats WorkHourMetrics into a clear Markdown summary for review or LLM input.
+     */
+    private formatMarkdownReport(repoName: string, metrics: WorkHourMetrics): string {
+        const prefixesLines =
+            Object.keys(metrics.subjectPrefixes).length > 0
+                ? Object.entries(metrics.subjectPrefixes)
+                    .map(([prefix, count]) => `- **${prefix}**: ${count}`)
+                    .join('\n')
+                : '- Nenhum commit encontrado no período';
+
+        return [
+            `# Estimativa de Horas — ${repoName}`,
+            '',
+            '## Faixa de Horas Estimadas',
+            `- **Otimista:** ${metrics.optimisticHours}h`,
+            `- **Base:** ${metrics.baseHours}h`,
+            `- **Conservadora:** ${metrics.conservativeHours}h`,
+            '',
+            '## Métricas do Histórico Git',
+            `- **Total de commits:** ${metrics.totalCommits}`,
+            `- **Dias ativos:** ${metrics.activeDays}`,
+            `- **Média de commits por dia ativo:** ${metrics.commitsPerActiveDay}`,
+            `- **Arquivos únicos tocados:** ${metrics.uniqueFilesTouched}`,
+            `- **Total de alterações em arquivos:** ${metrics.totalFileTouches}`,
+            '',
+            '## Filtros Aplicados',
+            `- **Since:** ${metrics.appliedFilters.since ?? 'não informado'}`,
+            `- **Until:** ${metrics.appliedFilters.until ?? 'não informado'}`,
+            `- **Author:** ${metrics.appliedFilters.author ?? 'todos'}`,
+            '',
+            '## Prefixos de Commit',
+            prefixesLines,
+            '',
+        ].join('\n');
     }
 
     /**

@@ -1,6 +1,7 @@
 import { DEFAULT_HOUR_ESTIMATION_CONFIG } from '@/services/constants/git-work-hours-estimator-service.constants';
-import type { CommitWorkItem } from '@/types/work-hour-estimator.types';
+import type { CommitWorkItem, WorkHourMetrics } from '@/types/work-hour-estimator.types';
 import { beforeEach, describe, expect, it, jest } from '@jest/globals';
+import { join, resolve } from 'node:path';
 
 /**
  * Callback type expected by Node's child_process.execFile.
@@ -18,6 +19,8 @@ type ExecFileMockFn = (
 ) => void;
 
 const mockExecFile = jest.fn<ExecFileMockFn>();
+const mockMkdir = jest.fn<(path: string, options?: { recursive?: boolean }) => Promise<string | undefined>>();
+const mockWriteFile = jest.fn<(filePath: string, data: string, encoding?: BufferEncoding) => Promise<void>>();
 
 // Step 1: Mock node:child_process before importing GitWorkHourEstimatorService.
 jest.unstable_mockModule('node:child_process', () => {
@@ -43,7 +46,13 @@ jest.unstable_mockModule('node:child_process', () => {
     };
 });
 
-// Step 2: Dynamically import the service after mocks are registered.
+// Step 2: Mock node:fs/promises so tests do not write real files to disk.
+jest.unstable_mockModule('node:fs/promises', () => ({
+    mkdir: mockMkdir,
+    writeFile: mockWriteFile,
+}));
+
+// Step 3: Dynamically import the service after mocks are registered.
 const { GitWorkHourEstimatorService } = await import('@/services/git-work-hour.service');
 
 /**
@@ -75,13 +84,14 @@ function buildMockGitLogStdout(
 describe('GitWorkHourEstimatorService', () => {
     beforeEach(() => {
         jest.clearAllMocks();
+        mockMkdir.mockResolvedValue(undefined);
+        mockWriteFile.mockResolvedValue(undefined);
     });
 
     /**
      * Verifies that getWorkItems applies the default 90-day filter and parses commits and files.
      */
     it('deve aplicar o filtro padrão de 90 dias e parsear commits com arquivos alterados', async () => {
-        // Step 1: Prepare simulated git log output with two commits on the same day.
         const stdout = buildMockGitLogStdout([
             {
                 hash: 'hash-1',
@@ -99,14 +109,12 @@ describe('GitWorkHourEstimatorService', () => {
             },
         ]);
 
-        // Step 2: Mock execFile so promisify(execFile) resolves immediately with stdout.
         mockExecFile.mockImplementation((_cmd, _args, _opts, callback) => {
             if (typeof callback === 'function') {
                 callback(null, stdout, '');
             }
         });
 
-        // Step 3: Instantiate the service and fetch parsed work items using default filters.
         const service = new GitWorkHourEstimatorService();
         const items = await service.getWorkItems('/repo/exemplo');
 
@@ -118,7 +126,6 @@ describe('GitWorkHourEstimatorService', () => {
             expect.any(Function)
         );
 
-        // Step 4: Type the expected array explicitly instead of passing a generic to toEqual.
         const expectedItems: CommitWorkItem[] = [
             {
                 hash: 'hash-1',
@@ -200,7 +207,6 @@ describe('GitWorkHourEstimatorService', () => {
 
         const metrics = service.calculateHourMetrics(items, DEFAULT_HOUR_ESTIMATION_CONFIG);
 
-        // 2 active days (2026-11-01 and 2026-11-02) * 6h + 3 unique files * 0.25h = 12.75 -> 12.8h
         expect(metrics.totalCommits).toBe(3);
         expect(metrics.activeDays).toBe(2);
         expect(metrics.commitsPerActiveDay).toBe(1.5);
@@ -263,5 +269,84 @@ describe('GitWorkHourEstimatorService', () => {
         });
         expect(result.activeDays).toBe(1);
         expect(result.baseHours).toBe(6.3);
+    });
+
+    /**
+     * Verifies that saveEstimateMarkdown creates estimate/<REPO_NAME> and writes the Markdown report.
+     */
+    it('deve criar a pasta estimate/NOME_REPOSITORIO e salvar o arquivo .md com as estimativas', async () => {
+        const service = new GitWorkHourEstimatorService();
+        const metrics: WorkHourMetrics = {
+            totalCommits: 4,
+            activeDays: 2,
+            commitsPerActiveDay: 2,
+            uniqueFilesTouched: 5,
+            totalFileTouches: 6,
+            appliedFilters: { since: '90 days ago' },
+            optimisticHours: 10.6,
+            baseHours: 13.3,
+            conservativeHours: 18,
+            subjectPrefixes: { feat: 3, fix: 1 },
+        };
+
+        const expectedDir = resolve(process.cwd(), 'estimate', 'meu-projeto');
+        const expectedFile = join(expectedDir, 'estimation.md');
+
+        const savedPath = await service.saveEstimateMarkdown('/repos/meu-projeto', metrics);
+
+        expect(savedPath).toBe(expectedFile);
+        expect(mockMkdir).toHaveBeenCalledWith(expectedDir, { recursive: true });
+        expect(mockWriteFile).toHaveBeenCalledWith(
+            expectedFile,
+            expect.stringContaining('# Estimativa de Horas — meu-projeto'),
+            'utf-8'
+        );
+        expect(mockWriteFile).toHaveBeenCalledWith(
+            expectedFile,
+            expect.stringContaining('10.6h'),
+            'utf-8'
+        );
+        expect(mockWriteFile).toHaveBeenCalledWith(
+            expectedFile,
+            expect.stringContaining('13.3h'),
+            'utf-8'
+        );
+        expect(mockWriteFile).toHaveBeenCalledWith(
+            expectedFile,
+            expect.stringContaining('18h'),
+            'utf-8'
+        );
+    });
+
+    /**
+     * Verifies that estimateAndSaveMarkdown calculates metrics and persists the Markdown report.
+     */
+    it('deve calcular métricas e salvar o arquivo .md em estimate/NOME_REPOSITORIO via estimateAndSaveMarkdown', async () => {
+        const stdout = buildMockGitLogStdout([
+            {
+                hash: 'h2',
+                authorName: 'Douglas',
+                authoredAt: '2026-11-15T14:00:00-03:00',
+                subject: 'feat: gera relatorio md',
+                files: ['src/services/git-work-hour.service.ts'],
+            },
+        ]);
+
+        mockExecFile.mockImplementation((_cmd, _args, _opts, callback) => {
+            if (typeof callback === 'function') {
+                callback(null, stdout, '');
+            }
+        });
+
+        const service = new GitWorkHourEstimatorService();
+        const result = await service.estimateAndSaveMarkdown('/repos/dsweb-cli');
+
+        const expectedDir = resolve(process.cwd(), 'estimate', 'dsweb-cli');
+        const expectedFile = join(expectedDir, 'estimation.md');
+
+        expect(result.filePath).toBe(expectedFile);
+        expect(result.metrics.activeDays).toBe(1);
+        expect(mockMkdir).toHaveBeenCalledWith(expectedDir, { recursive: true });
+        expect(mockWriteFile).toHaveBeenCalledWith(expectedFile, expect.any(String), 'utf-8');
     });
 });
